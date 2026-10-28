@@ -14,10 +14,14 @@
 #  Then clones the GitHub repo, builds the apps, creates the schema + sample
 #  data and zip-deploys everything.
 #
-#  Run from Azure Cloud Shell (bash) or any machine with: az, git, node>=20, npm, zip, curl
+#  Designed for WSL (Ubuntu/Debian) - also works on Linux and Azure Cloud Shell.
+#  Missing prerequisites (Azure CLI, git, Node.js 22, zip, curl) are installed
+#  automatically with apt (you may be asked for your sudo password).
+#  Windows binaries visible through /mnt/c are ignored - native Linux tools are used.
 #
 #  Usage:
-#    ./azure-deploy.sh                                   # defaults below
+#    ./azure-deploy.sh                                   # defaults below (Central India)
+#    SUBSCRIPTION="My Sub" ./azure-deploy.sh             # pick a subscription
 #    LOCATION=westeurope PREFIX=msshop ./azure-deploy.sh
 #    ADMIN_UPNS="alice@contoso.com,bob@contoso.com" ./azure-deploy.sh
 # =============================================================================
@@ -26,7 +30,8 @@ set -euo pipefail
 # ----------------------------- parameters -----------------------------------
 REPO_URL="${REPO_URL:-https://github.com/wshamroukh/msproducts-purchasing-portal.git}"
 BRANCH="${BRANCH:-main}"
-LOCATION="${LOCATION:-uaenorth}"
+LOCATION="${LOCATION:-centralindia}"
+SUBSCRIPTION="${SUBSCRIPTION:-}"          # subscription name or id (default: current az cli subscription)
 PREFIX="${PREFIX:-msstore}"
 SUFFIX="${SUFFIX:-$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 5 || true)}"
 RG="${RG:-rg-${PREFIX}-${SUFFIX}}"
@@ -78,12 +83,67 @@ trap 'rm -rf "$WORKDIR"' EXIT
 # state file (written as resources are created, so cleanup.sh works even after a failed run)
 save() { echo "$1=$2" >>"$OUT_FILE"; }
 
-# ----------------------------- pre-flight -----------------------------------
+# ----------------------------- prerequisites --------------------------------
+# A command counts as installed only if it is a native Linux binary (not a Windows one under /mnt/*).
+have() { local p; p=$(command -v "$1" 2>/dev/null) || return 1; [[ "$p" != /mnt/* ]]; }
+
+SUDO=""
+if [[ $EUID -ne 0 ]]; then
+  have sudo || die "sudo is required to install prerequisites (or run the script as root)"
+  SUDO="sudo"
+fi
+APT_UPDATED=0
+apt_install() {
+  have apt-get || die "apt-get not found. Install these manually and re-run: $*"
+  if [[ $APT_UPDATED -eq 0 ]]; then $SUDO apt-get update -qq; APT_UPDATED=1; fi
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >/dev/null
+}
+
 step "Checking prerequisites"
-for t in az git node npm zip curl; do command -v "$t" >/dev/null || die "'$t' is required"; done
-NODE_MAJOR=$(node -p 'process.versions.node.split(".")[0]')
-[[ $NODE_MAJOR -ge 20 ]] || die "Node.js 20+ is required (found $(node -v))"
-az account show >/dev/null 2>&1 || die "Run 'az login' first"
+if grep -qi microsoft /proc/version 2>/dev/null; then ok "Running in WSL"; fi
+
+MISSING=()
+for t in curl git zip unzip; do have "$t" || MISSING+=("$t"); done
+have gpg || MISSING+=("gnupg")
+if [[ ${#MISSING[@]} -gt 0 ]]; then
+  warn "Installing: ${MISSING[*]}"
+  apt_install ca-certificates lsb-release "${MISSING[@]}"
+fi
+ok "curl, git, zip"
+
+NODE_OK=0
+if have node && have npm; then
+  NODE_MAJOR=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)
+  [[ $NODE_MAJOR -ge 20 ]] && NODE_OK=1
+fi
+if [[ $NODE_OK -eq 0 ]]; then
+  warn "Installing Node.js 22 LTS (NodeSource)"
+  curl -fsSL https://deb.nodesource.com/setup_22.x -o "$WORKDIR/nodesource_setup.sh"
+  $SUDO bash "$WORKDIR/nodesource_setup.sh" >/dev/null
+  APT_UPDATED=1
+  apt_install nodejs
+  hash -r
+  have node || die "Node.js installation failed"
+fi
+ok "Node.js $(node -v), npm $(npm -v)"
+
+if ! have az; then
+  warn "Installing Azure CLI"
+  curl -sL https://aka.ms/InstallAzureCLIDeb -o "$WORKDIR/install_az.sh"
+  $SUDO bash "$WORKDIR/install_az.sh" >/dev/null
+  hash -r
+  have az || die "Azure CLI installation failed"
+fi
+ok "Azure CLI $(az version --query '"azure-cli"' -o tsv 2>/dev/null)"
+
+# ----------------------------- sign in --------------------------------------
+if ! az account show >/dev/null 2>&1; then
+  step "Signing in to Azure (device code - open the link in your Windows browser)"
+  az login --use-device-code -o none
+fi
+if [[ -n "$SUBSCRIPTION" ]]; then
+  az account set --subscription "$SUBSCRIPTION"
+fi
 
 TENANT_ID=$(az account show --query tenantId -o tsv)
 SUB_ID=$(az account show --query id -o tsv)
