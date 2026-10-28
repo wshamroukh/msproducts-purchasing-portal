@@ -7,6 +7,8 @@
 #    - Virtual network with a private endpoint + private DNS zone for SQL
 #    - Azure SQL logical server (Microsoft Entra-only auth, public access DISABLED) + database
 #    - Linux App Service plan + 3 web apps (API, purchasing portal, admin portal)
+#    - API web app reachable ONLY through a private endpoint (public access denied);
+#      the portal and admin web apps use VNet integration and forward /api/* to it
 #    - API web app integrated into the VNet; its system-assigned managed identity
 #      is the SQL Entra admin, so it creates the schema + sample data itself at start-up
 #      (no passwords, no firewall rules, works with "deny public network access" policies)
@@ -53,6 +55,7 @@ VNET_CIDR="${VNET_CIDR:-10.20.0.0/16}"
 APP_SUBNET_CIDR="${APP_SUBNET_CIDR:-10.20.1.0/24}"
 PE_SUBNET_CIDR="${PE_SUBNET_CIDR:-10.20.2.0/24}"
 SQL_DNS_ZONE="privatelink.database.windows.net"
+WEB_DNS_ZONE="privatelink.azurewebsites.net"
 
 WORKDIR="$(mktemp -d)"
 OUT_FILE="${OUT_FILE:-$PWD/deployment-${PREFIX}-${SUFFIX}.env}"
@@ -88,12 +91,11 @@ save() { echo "$1=$2" >>"$OUT_FILE"; }
 have() { local p; p=$(command -v "$1" 2>/dev/null) || return 1; [[ "$p" != /mnt/* ]]; }
 
 SUDO=""
-if [[ $EUID -ne 0 ]]; then
-  have sudo || die "sudo is required to install prerequisites (or run the script as root)"
-  SUDO="sudo"
-fi
+if [[ $EUID -ne 0 ]]; then SUDO="sudo"; fi
+need_sudo() { [[ -z "$SUDO" ]] || have sudo || die "sudo is required to install missing prerequisites (or run the script as root)"; }
 APT_UPDATED=0
 apt_install() {
+  need_sudo
   have apt-get || die "apt-get not found. Install these manually and re-run: $*"
   if [[ $APT_UPDATED -eq 0 ]]; then $SUDO apt-get update -qq; APT_UPDATED=1; fi
   $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >/dev/null
@@ -118,6 +120,7 @@ if have node && have npm; then
 fi
 if [[ $NODE_OK -eq 0 ]]; then
   warn "Installing Node.js 22 LTS (NodeSource)"
+  need_sudo
   curl -fsSL https://deb.nodesource.com/setup_22.x -o "$WORKDIR/nodesource_setup.sh"
   $SUDO bash "$WORKDIR/nodesource_setup.sh" >/dev/null
   APT_UPDATED=1
@@ -129,6 +132,7 @@ ok "Node.js $(node -v), npm $(npm -v)"
 
 if ! have az; then
   warn "Installing Azure CLI"
+  need_sudo
   curl -sL https://aka.ms/InstallAzureCLIDeb -o "$WORKDIR/install_az.sh"
   $SUDO bash "$WORKDIR/install_az.sh" >/dev/null
   hash -r
@@ -153,9 +157,62 @@ ME_UPN=$(az ad signed-in-user show --query userPrincipalName -o tsv)
 ok "Subscription : $SUB_NAME ($SUB_ID)"
 ok "Tenant       : $TENANT_ID"
 ok "Signed in as : $ME_UPN"
-ok "Location     : $LOCATION   Resource group: $RG"
-: >"$OUT_FILE"; save RG "$RG"; save LOCATION "$LOCATION"
-ok "State file   : $OUT_FILE"
+[[ -z "${REDEPLOY_RG:-}" ]] && ok "Location     : $LOCATION   Resource group: $RG"
+
+# ----------------------------- build & deploy functions ---------------------
+build_api() {
+  step "Building the API"
+  (cd "$SRC/api" && npm install --omit=dev --no-audit --no-fund --loglevel=error)
+  (cd "$SRC/api" && zip -qr "$WORKDIR/api.zip" src db scripts package.json node_modules)
+  ok "api.zip"
+}
+
+build_spa() { # <folder>
+  (cd "$SRC/$1" && npm install --no-audit --no-fund --loglevel=error && npm run build --silent)
+  rm -f "$SRC/$1/dist/config.json"   # generated at runtime from the App Settings
+  (cd "$SRC/$1" && zip -qr "$WORKDIR/$1.zip" dist server.cjs)
+  ok "$1.zip"
+}
+build_all() {
+  build_api
+  step "Building the purchasing portal"; build_spa portal
+  step "Building the admin portal";      build_spa admin
+}
+
+# Zip deploy with retries. Kudu often answers 502 for a minute or two after app settings,
+# VNet integration or startup-command changes restart the site, so we wait and retry.
+deploy_zip() { # <app> <zip>
+  local app=$1 zip=$2 log="$WORKDIR/deploy-$1.log" i
+  for i in 1 2 3 4 5; do
+    if az webapp deploy -g "$RG" -n "$app" --src-path "$zip" --type zip -o none >"$log" 2>&1; then
+      ok "$app"; return 0
+    fi
+    warn "Deployment to $app failed (attempt $i/5): $(grep -m1 -iE 'error code|error:|failed' "$log" | tr -s ' ' | cut -c1-160)"
+    [[ $i -lt 5 ]] && { warn "waiting $((i * 30))s for the site to settle…"; sleep $((i * 30)); }
+  done
+  cat "$log" >&2
+  die "Could not deploy $app. Logs: az webapp log deployment show -g $RG -n $app   |   az webapp log tail -g $RG -n $app"
+}
+
+deploy_all() {
+  step "Waiting 60s for the web apps to restart after configuration changes"
+  sleep 60
+  step "Deploying code (zip deploy, run-from-package)"
+  deploy_zip "$API_APP"    "$WORKDIR/api.zip"
+  deploy_zip "$PORTAL_APP" "$WORKDIR/portal.zip"
+  deploy_zip "$ADMIN_APP"  "$WORKDIR/admin.zip"
+}
+
+wait_healthy() { # <health url>
+  step "Waiting for the API to report healthy (first start creates the tables and sample data)"
+  local i status=""
+  for ((i = 1; i <= 36; i++)); do
+    status=$(curl -s -o /dev/null --max-time 20 -w '%{http_code}' "$1" || true)
+    if [[ "$status" == "200" ]]; then ok "API healthy ($1)"; return 0; fi
+    sleep 10
+  done
+  warn "API not healthy yet ($1, last HTTP $status) - check: az webapp log tail -g $RG -n $API_APP"
+}
 
 # ----------------------------- source code ----------------------------------
 step "Cloning $REPO_URL ($BRANCH)"
@@ -163,7 +220,33 @@ git clone --quiet --depth 1 --branch "$BRANCH" "$REPO_URL" "$WORKDIR/src"
 SRC="$WORKDIR/src"
 ok "Cloned to $SRC"
 
+# ----------------------------- code-only redeploy ---------------------------
+# REDEPLOY_RG=rg-msstore-xxxxx ./azure-deploy.sh   -> rebuild + redeploy code to an existing environment
+if [[ -n "${REDEPLOY_RG:-}" ]]; then
+  RG="$REDEPLOY_RG"
+  step "Code-only redeploy to $RG"
+  az group show -n "$RG" -o none 2>/dev/null || die "Resource group $RG not found"
+  find_app() { az webapp list -g "$RG" --query "[?contains(name, '-$1-')].name | [0]" -o tsv; }
+  API_APP=$(find_app api); PORTAL_APP=$(find_app portal); ADMIN_APP=$(find_app admin)
+  [[ -n "$API_APP" && -n "$PORTAL_APP" && -n "$ADMIN_APP" ]] || die "Could not find the api/portal/admin web apps in $RG"
+  ok "API $API_APP, portal $PORTAL_APP, admin $ADMIN_APP"
+  for app in "$API_APP" "$PORTAL_APP" "$ADMIN_APP"; do
+    az webapp config appsettings set -g "$RG" -n "$app" -o none --settings WEBSITE_RUN_FROM_PACKAGE=1 SCM_DO_BUILD_DURING_DEPLOYMENT=false
+  done
+  build_all
+  deploy_all
+  PORTAL_URL="https://$(az webapp show -g "$RG" -n "$PORTAL_APP" --query defaultHostName -o tsv)"
+  API_URL="https://$(az webapp show -g "$RG" -n "$API_APP" --query defaultHostName -o tsv)"
+  PROXY=$(az webapp config appsettings list -g "$RG" -n "$PORTAL_APP" --query "[?name=='API_PROXY_TARGET'].value | [0]" -o tsv)
+  if [[ -n "$PROXY" ]]; then wait_healthy "$PORTAL_URL/api/health"; else wait_healthy "$API_URL/api/health"; fi
+  echo -e "\n${c_ok}Redeploy complete:${c_off} $PORTAL_URL"
+  exit 0
+fi
+
 # ----------------------------- resource group -------------------------------
+: >"$OUT_FILE"; save RG "$RG"; save LOCATION "$LOCATION"
+ok "State file   : $OUT_FILE"
+
 step "Creating resource group"
 az group create -n "$RG" -l "$LOCATION" --tags app=msproducts-purchasing-portal -o none
 ok "$RG"
@@ -229,7 +312,7 @@ create_spa() { # <display-name> <url>   -> prints the new appId
    {"resourceAppId":"00000003-0000-0000-c000-000000000000","resourceAccess":[{"id":"e1fe6dd8-ba31-4d61-89e7-88639da4683d","type":"Scope"}]}]}
 JSON
 )"
-  az ad sp create --id "$id" -o none 2>/dev/null || true
+  az ad sp create --id "$id" -o none >/dev/null 2>&1 || true
   echo "$id"
 }
 
@@ -305,25 +388,34 @@ az network private-endpoint dns-zone-group create -g "$RG" --endpoint-name "pe-$
   -n default --private-dns-zone "$SQL_DNS_ZONE" --zone-name sql -o none
 ok "$SQL_FQDN now resolves to a private IP inside $VNET"
 
-step "Connecting the API web app to the virtual network"
-az webapp vnet-integration add -g "$RG" -n "$API_APP" --vnet "$VNET" --subnet snet-app -o none
-az webapp config set -g "$RG" -n "$API_APP" --vnet-route-all-enabled true -o none
-ok "$API_APP -> $VNET/snet-app"
+step "Connecting the web apps to the virtual network (outbound)"
+# All 3 apps share the plan, so they share the integration subnet.
+#  - API      -> SQL private endpoint
+#  - portal / admin -> API private endpoint (their server forwards /api/* to the API)
+for app in "$API_APP" "$PORTAL_APP" "$ADMIN_APP"; do
+  az webapp vnet-integration add -g "$RG" -n "$app" --vnet "$VNET" --subnet snet-app -o none
+  az webapp config set -g "$RG" -n "$app" --vnet-route-all-enabled true -o none
+  ok "$app -> $VNET/snet-app"
+done
 
-# ----------------------------- build ----------------------------------------
-step "Building the API"
-(cd "$SRC/api" && npm install --omit=dev --no-audit --no-fund --loglevel=error)
-(cd "$SRC/api" && zip -qr "$WORKDIR/api.zip" src db scripts package.json node_modules)
-ok "api.zip"
+step "Creating the API private endpoint and private DNS zone (inbound)"
+API_ID=$(az webapp show -g "$RG" -n "$API_APP" --query id -o tsv)
+az network private-endpoint create -g "$RG" -n "pe-$API_APP" -l "$LOCATION" \
+  --vnet-name "$VNET" --subnet snet-pe --private-connection-resource-id "$API_ID" \
+  --group-id sites --connection-name "plc-$API_APP" -o none
+az network private-dns zone create -g "$RG" -n "$WEB_DNS_ZONE" -o none
+az network private-dns link vnet create -g "$RG" -z "$WEB_DNS_ZONE" -n "link-$VNET" \
+  --virtual-network "$VNET" --registration-enabled false -o none
+az network private-endpoint dns-zone-group create -g "$RG" --endpoint-name "pe-$API_APP" \
+  -n default --private-dns-zone "$WEB_DNS_ZONE" --zone-name sites -o none
+ok "$API_HOST now resolves to a private IP inside $VNET"
 
-build_spa() { # <folder>
-  (cd "$SRC/$1" && npm install --no-audit --no-fund --loglevel=error && npm run build --silent)
-  rm -f "$SRC/$1/dist/config.json"   # generated at runtime from the App Settings
-  (cd "$SRC/$1" && zip -qr "$WORKDIR/$1.zip" dist server.cjs)
-  ok "$1.zip"
-}
-step "Building the purchasing portal"; build_spa portal
-step "Building the admin portal";      build_spa admin
+step "Blocking public access to the API"
+# Main site: deny everything that does not come through the private endpoint.
+# Deployment (SCM/Kudu) site: stays reachable so this script can zip-deploy (it still requires Entra ID auth).
+az webapp config set -g "$RG" -n "$API_APP" -o none --generic-configurations \
+  '{"ipSecurityRestrictionsDefaultAction":"Deny","scmIpSecurityRestrictionsDefaultAction":"Allow","scmIpSecurityRestrictionsUseMain":false}'
+ok "$API_URL is no longer reachable from the internet"
 
 # ----------------------------- configure & deploy ----------------------------
 step "Configuring app settings"
@@ -331,32 +423,24 @@ API_SCOPE="api://$API_CLIENT_ID/$SCOPE_NAME"
 az webapp config appsettings set -g "$RG" -n "$API_APP" -o none --settings \
   AUTH_MODE=entra TENANT_ID="$TENANT_ID" API_CLIENT_ID="$API_CLIENT_ID" API_SCOPE_NAME="$SCOPE_NAME" ADMIN_ROLE="$ADMIN_ROLE" \
   SQL_SERVER="$SQL_FQDN" SQL_DATABASE="$DB_NAME" SQL_AUTH=managed-identity DB_AUTO_INIT=true \
-  CORS_ORIGINS="$PORTAL_URL,$ADMIN_URL" SCM_DO_BUILD_DURING_DEPLOYMENT=false
+  CORS_ORIGINS="$PORTAL_URL,$ADMIN_URL" SCM_DO_BUILD_DURING_DEPLOYMENT=false WEBSITE_RUN_FROM_PACKAGE=1
 az webapp config set -g "$RG" -n "$API_APP" --startup-file "node src/server.js" -o none
 
 az webapp config appsettings set -g "$RG" -n "$PORTAL_APP" -o none --settings \
-  AUTH_MODE=entra TENANT_ID="$TENANT_ID" CLIENT_ID="$PORTAL_CLIENT_ID" API_SCOPE="$API_SCOPE" API_BASE_URL="$API_URL" \
-  APP_TITLE="Microsoft Products Purchasing Portal" SCM_DO_BUILD_DURING_DEPLOYMENT=false
+  AUTH_MODE=entra TENANT_ID="$TENANT_ID" CLIENT_ID="$PORTAL_CLIENT_ID" API_SCOPE="$API_SCOPE" API_PROXY_TARGET="$API_URL" \
+  APP_TITLE="Microsoft Products Purchasing Portal" SCM_DO_BUILD_DURING_DEPLOYMENT=false WEBSITE_RUN_FROM_PACKAGE=1
 az webapp config set -g "$RG" -n "$PORTAL_APP" --startup-file "node server.cjs" -o none
 
 az webapp config appsettings set -g "$RG" -n "$ADMIN_APP" -o none --settings \
-  AUTH_MODE=entra TENANT_ID="$TENANT_ID" CLIENT_ID="$ADMIN_CLIENT_ID" API_SCOPE="$API_SCOPE" API_BASE_URL="$API_URL" \
-  APP_TITLE="Purchasing Portal - Admin" SCM_DO_BUILD_DURING_DEPLOYMENT=false
+  AUTH_MODE=entra TENANT_ID="$TENANT_ID" CLIENT_ID="$ADMIN_CLIENT_ID" API_SCOPE="$API_SCOPE" API_PROXY_TARGET="$API_URL" \
+  APP_TITLE="Purchasing Portal - Admin" SCM_DO_BUILD_DURING_DEPLOYMENT=false WEBSITE_RUN_FROM_PACKAGE=1
 az webapp config set -g "$RG" -n "$ADMIN_APP" --startup-file "node server.cjs" -o none
 ok "done"
 
-step "Deploying code (zip deploy)"
-az webapp deploy -g "$RG" -n "$API_APP"    --src-path "$WORKDIR/api.zip"    --type zip -o none && ok "$API_APP"
-az webapp deploy -g "$RG" -n "$PORTAL_APP" --src-path "$WORKDIR/portal.zip" --type zip -o none && ok "$PORTAL_APP"
-az webapp deploy -g "$RG" -n "$ADMIN_APP"  --src-path "$WORKDIR/admin.zip"  --type zip -o none && ok "$ADMIN_APP"
-
-step "Waiting for the API to report healthy (first start creates the tables and sample data)"
-for i in $(seq 1 30); do
-  status=$(curl -s -o /dev/null --max-time 20 -w '%{http_code}' "$API_URL/api/health" || true)
-  if [[ "$status" == "200" ]]; then ok "API healthy"; break; fi
-  [[ $i -eq 30 ]] && warn "API not healthy yet - check: az webapp log tail -g $RG -n $API_APP"
-  sleep 10
-done
+# building takes a few minutes, which also gives the sites time to restart after the settings change
+build_all
+deploy_all
+wait_healthy "$PORTAL_URL/api/health"
 
 # ----------------------------- summary --------------------------------------
 cat >"$OUT_FILE" <<ENV
@@ -382,7 +466,7 @@ echo -e "${c_ok} Deployment complete${c_off}"
 echo -e "${c_ok}=====================================================================${c_off}"
 echo "  Purchasing portal : $PORTAL_URL"
 echo "  Admin portal      : $ADMIN_URL   ($ME_UPN has the $ADMIN_ROLE role)"
-echo "  API health        : $API_URL/api/health"
+echo "  API health        : $PORTAL_URL/api/health   (API itself is private: $API_URL)"
 echo "  Settings saved to : $OUT_FILE   (used by cleanup.sh)"
 echo
 echo "  Note: the first request can take ~30-60s while the apps warm up."
