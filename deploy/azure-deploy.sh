@@ -184,13 +184,17 @@ build_all() {
 deploy_zip() { # <app> <zip>
   local app=$1 zip=$2 log="$WORKDIR/deploy-$1.log" i
   for i in 1 2 3 4 5; do
-    if az webapp deploy -g "$RG" -n "$app" --src-path "$zip" --type zip -o none >"$log" 2>&1; then
+    # --track-status false: upload + Kudu deployment only. Startup is verified by our own health check
+    # (the CLI's startup tracking fails when the site is private or still initialising the database).
+    if az webapp deploy -g "$RG" -n "$app" --src-path "$zip" --type zip --track-status false -o none >"$log" 2>&1; then
       ok "$app"; return 0
     fi
     warn "Deployment to $app failed (attempt $i/5): $(grep -m1 -iE 'error code|error:|failed' "$log" | tr -s ' ' | cut -c1-160)"
     [[ $i -lt 5 ]] && { warn "waiting $((i * 30))s for the site to settle…"; sleep $((i * 30)); }
   done
   cat "$log" >&2
+  warn "Kudu deployment log:"
+  az webapp log deployment show -g "$RG" -n "$app" --query "[].message" -o tsv 2>/dev/null | tail -20 >&2 || true
   die "Could not deploy $app. Logs: az webapp log deployment show -g $RG -n $app   |   az webapp log tail -g $RG -n $app"
 }
 
@@ -201,6 +205,22 @@ deploy_all() {
   deploy_zip "$API_APP"    "$WORKDIR/api.zip"
   deploy_zip "$PORTAL_APP" "$WORKDIR/portal.zip"
   deploy_zip "$ADMIN_APP"  "$WORKDIR/admin.zip"
+}
+
+# Public access to the API web app.
+#   lock: only reachable through its private endpoint (main + deployment/SCM site)
+#   open: temporarily reachable so code can be zip-deployed from this machine
+api_access() { # open|lock
+  local id; id=$(az webapp show -g "$RG" -n "$API_APP" --query id -o tsv)
+  if [[ $1 == open ]]; then
+    az resource update --ids "$id" --set properties.publicNetworkAccess=Enabled -o none
+    az webapp config set -g "$RG" -n "$API_APP" -o none --generic-configurations \
+      '{"ipSecurityRestrictionsDefaultAction":"Allow","scmIpSecurityRestrictionsDefaultAction":"Allow","scmIpSecurityRestrictionsUseMain":false}'
+  else
+    az webapp config set -g "$RG" -n "$API_APP" -o none --generic-configurations \
+      '{"ipSecurityRestrictionsDefaultAction":"Deny","scmIpSecurityRestrictionsDefaultAction":"Deny","scmIpSecurityRestrictionsUseMain":true}'
+    az resource update --ids "$id" --set properties.publicNetworkAccess=Disabled -o none
+  fi
 }
 
 wait_healthy() { # <health url>
@@ -234,7 +254,20 @@ if [[ -n "${REDEPLOY_RG:-}" ]]; then
     az webapp config appsettings set -g "$RG" -n "$app" -o none --settings WEBSITE_RUN_FROM_PACKAGE=1 SCM_DO_BUILD_DURING_DEPLOYMENT=false
   done
   build_all
+  API_LOCKED=0
+  if az network private-endpoint show -g "$RG" -n "pe-$API_APP" -o none 2>/dev/null; then
+    API_LOCKED=1
+    step "Temporarily opening public access to $API_APP for the deployment"
+    api_access open
+    trap 'warn "Re-locking $API_APP"; api_access lock; rm -rf "$WORKDIR"' EXIT
+    ok "opened (requests still need a valid Entra ID token)"
+  fi
   deploy_all
+  if [[ $API_LOCKED -eq 1 ]]; then
+    step "Locking $API_APP again"
+    api_access lock; trap 'rm -rf "$WORKDIR"' EXIT
+    ok "$API_APP is private again"
+  fi
   PORTAL_URL="https://$(az webapp show -g "$RG" -n "$PORTAL_APP" --query defaultHostName -o tsv)"
   API_URL="https://$(az webapp show -g "$RG" -n "$API_APP" --query defaultHostName -o tsv)"
   PROXY=$(az webapp config appsettings list -g "$RG" -n "$PORTAL_APP" --query "[?name=='API_PROXY_TARGET'].value | [0]" -o tsv)
@@ -398,25 +431,6 @@ for app in "$API_APP" "$PORTAL_APP" "$ADMIN_APP"; do
   ok "$app -> $VNET/snet-app"
 done
 
-step "Creating the API private endpoint and private DNS zone (inbound)"
-API_ID=$(az webapp show -g "$RG" -n "$API_APP" --query id -o tsv)
-az network private-endpoint create -g "$RG" -n "pe-$API_APP" -l "$LOCATION" \
-  --vnet-name "$VNET" --subnet snet-pe --private-connection-resource-id "$API_ID" \
-  --group-id sites --connection-name "plc-$API_APP" -o none
-az network private-dns zone create -g "$RG" -n "$WEB_DNS_ZONE" -o none
-az network private-dns link vnet create -g "$RG" -z "$WEB_DNS_ZONE" -n "link-$VNET" \
-  --virtual-network "$VNET" --registration-enabled false -o none
-az network private-endpoint dns-zone-group create -g "$RG" --endpoint-name "pe-$API_APP" \
-  -n default --private-dns-zone "$WEB_DNS_ZONE" --zone-name sites -o none
-ok "$API_HOST now resolves to a private IP inside $VNET"
-
-step "Blocking public access to the API"
-# Main site: deny everything that does not come through the private endpoint.
-# Deployment (SCM/Kudu) site: stays reachable so this script can zip-deploy (it still requires Entra ID auth).
-az webapp config set -g "$RG" -n "$API_APP" -o none --generic-configurations \
-  '{"ipSecurityRestrictionsDefaultAction":"Deny","scmIpSecurityRestrictionsDefaultAction":"Allow","scmIpSecurityRestrictionsUseMain":false}'
-ok "$API_URL is no longer reachable from the internet"
-
 # ----------------------------- configure & deploy ----------------------------
 step "Configuring app settings"
 API_SCOPE="api://$API_CLIENT_ID/$SCOPE_NAME"
@@ -439,7 +453,26 @@ ok "done"
 
 # building takes a few minutes, which also gives the sites time to restart after the settings change
 build_all
-deploy_all
+deploy_all      # the API is still publicly reachable at this point, so zip deploy works
+
+# ----------------------------- lock down the API ----------------------------
+step "Creating the API private endpoint and private DNS zone (inbound)"
+API_ID=$(az webapp show -g "$RG" -n "$API_APP" --query id -o tsv)
+az network private-endpoint create -g "$RG" -n "pe-$API_APP" -l "$LOCATION" \
+  --vnet-name "$VNET" --subnet snet-pe --private-connection-resource-id "$API_ID" \
+  --group-id sites --connection-name "plc-$API_APP" -o none
+az network private-dns zone create -g "$RG" -n "$WEB_DNS_ZONE" -o none
+az network private-dns link vnet create -g "$RG" -z "$WEB_DNS_ZONE" -n "link-$VNET" \
+  --virtual-network "$VNET" --registration-enabled false -o none
+az network private-endpoint dns-zone-group create -g "$RG" --endpoint-name "pe-$API_APP" \
+  -n default --private-dns-zone "$WEB_DNS_ZONE" --zone-name sites -o none
+ok "$API_HOST now resolves to a private IP inside $VNET"
+
+step "Blocking all public access to the API (main and deployment site)"
+api_access lock
+ok "$API_URL is reachable only through its private endpoint"
+ok "To deploy new code later run: REDEPLOY_RG=$RG ./azure-deploy.sh (it opens the API temporarily)"
+
 wait_healthy "$PORTAL_URL/api/health"
 
 # ----------------------------- summary --------------------------------------
