@@ -224,14 +224,24 @@ api_access() { # open|lock
 }
 
 wait_healthy() { # <health url>
-  step "Waiting for the API to report healthy (first start creates the tables and sample data)"
-  local i status=""
+  # The API itself is private (403 from the internet), so this is called with the PORTAL's /api/health:
+  # browser/curl -> portal web app -> (VNet integration) -> API private endpoint -> API -> SQL private endpoint.
+  # We require the API's JSON answer, so a portal that only returns its own HTML page does not count as healthy.
+  step "Waiting for the API to report healthy via $1"
+  local i body="" code=""
   for ((i = 1; i <= 36; i++)); do
-    status=$(curl -s -o /dev/null --max-time 20 -w '%{http_code}' "$1" || true)
-    if [[ "$status" == "200" ]]; then ok "API healthy ($1)"; return 0; fi
+    body=$(curl -s --max-time 20 -w '\n%{http_code}' "$1" || true)
+    code=${body##*$'\n'}; body=${body%$'\n'*}
+    if [[ "$code" == "200" && "$body" == *'"status":"healthy"'* ]]; then ok "API healthy: $body"; return 0; fi
+    if [[ "$code" == "200" && "$body" == *"<html"* ]]; then
+      warn "$1 returned the portal web page instead of the API - is portal/server.cjs (with the /api proxy) pushed to GitHub?"
+      return 1
+    fi
+    [[ $((i % 3)) -eq 0 ]] && warn "not yet (HTTP ${code:-none}) ${body:0:160}"
     sleep 10
   done
-  warn "API not healthy yet ($1, last HTTP $status) - check: az webapp log tail -g $RG -n $API_APP"
+  warn "API not healthy yet ($1, last HTTP $code: ${body:0:200})"
+  warn "Check: az webapp log tail -g $RG -n $API_APP   and   az webapp log tail -g $RG -n $PORTAL_APP"
 }
 
 # ----------------------------- source code ----------------------------------
