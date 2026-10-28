@@ -52,6 +52,9 @@ app.get('/api/health', async (_req, res) => {
   try {
     const pool = await getPool();
     await pool.request().query('SELECT 1 AS ok');
+    if (!dbState.initialized) {
+      return res.status(503).json({ status: 'starting', database: 'initializing', error: dbState.lastError });
+    }
     res.json({ status: 'healthy', database: 'connected', authMode: config.auth.mode });
   } catch (err) {
     res.status(503).json({ status: 'unhealthy', database: 'unreachable', error: err.message });
@@ -75,16 +78,27 @@ app.use((err, _req, res, _next) => {
   res.status(status).json({ error: status >= 500 ? 'Something went wrong on the server' : err.message });
 });
 
-async function start() {
-  if (config.dbAutoInit) {
-    try {
-      await ensureDatabaseExists();
-      await initDatabase(await getPool(), { seed: true });
-    } catch (err) {
-      console.error('[db] auto-init failed:', err.message);
-    }
+// Database initialisation (schema + sample data). Retries in the background until it succeeds,
+// e.g. while the private endpoint DNS or the managed identity token is still propagating.
+const dbState = { initialized: !config.dbAutoInit, lastError: null };
+
+async function initWithRetry(attempt = 1) {
+  try {
+    await ensureDatabaseExists();
+    await initDatabase(await getPool(), { seed: true });
+    dbState.initialized = true;
+    dbState.lastError = null;
+  } catch (err) {
+    dbState.lastError = err.message;
+    const delay = Math.min(10000 * attempt, 60000);
+    console.error(`[db] auto-init attempt ${attempt} failed: ${err.message} - retrying in ${delay / 1000}s`);
+    setTimeout(() => initWithRetry(attempt + 1), delay);
   }
+}
+
+function start() {
   app.listen(config.port, () => console.log(`msstore-api listening on port ${config.port} (auth: ${config.auth.mode})`));
+  if (config.dbAutoInit) initWithRetry();
 }
 
 if (require.main === module) start();

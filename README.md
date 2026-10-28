@@ -15,10 +15,12 @@ Both front-ends sign users in with **Microsoft Entra ID**.
         │ Backend API – Node.js / Express            │                Business tier
         │ validates tokens, Store.Admin app role     │                (App Service)
         └────────────────────┬───────────────────────┘
+                             │  VNet integration → private endpoint
                              │  TDS/TLS – managed identity (no passwords)
                              ▼
         ┌────────────────────────────────────────────┐
-        │ Azure SQL Database (Entra-only auth)       │                Data tier
+        │ Azure SQL Database (Entra-only auth,       │                Data tier
+        │ public network access disabled)            │
         └────────────────────────────────────────────┘
 ```
 
@@ -97,9 +99,13 @@ What the script does:
 2. Creates a resource group, a Linux App Service plan and 3 web apps (Node 22 LTS)
 3. Creates 3 **Entra ID app registrations**: the API (exposes scope `access_as_user` and app role `Store.Admin`, access token v2) and the two SPAs (redirect URIs, API permission, pre-authorized so no consent prompt for the API)
 4. Assigns **you** the `Store.Admin` role
-5. Creates an **Azure SQL** server with Entra-only authentication (you are the Entra admin) and a database
-6. Builds the API and both SPAs, creates the tables and **sample data**, and creates a contained database user for the API's **managed identity**
-7. Sets App Settings and zip-deploys the three apps, then waits for `/api/health`
+5. Creates a **virtual network**, an **Azure SQL** server with Entra-only authentication and **public network access disabled**,
+   a **private endpoint** + private DNS zone, and connects the API web app to the VNet
+6. Makes the API's **managed identity** the SQL Entra admin – on first start the API creates the tables and **sample data** itself
+7. Builds the API and both SPAs, sets App Settings, zip-deploys the three apps and waits for `/api/health`
+
+This works in subscriptions with policies that deny public access to SQL (no firewall rules are needed).
+The state file is written while the script runs, so `cleanup.sh` also works after a failed run.
 
 At the end it prints the portal, admin and API URLs and writes `deployment-<prefix>-<suffix>.env`.
 Remove everything with `./cleanup.sh deployment-<prefix>-<suffix>.env`.
@@ -164,6 +170,8 @@ To use Entra ID locally, set `AUTH_MODE=entra`, `TENANT_ID` and `API_CLIENT_ID` 
 
 ## Notes
 
+- The database is reachable only from inside the VNet. To query it yourself, use a VM/Bastion or VPN into the VNet and
+  temporarily set yourself (or a group you belong to) as the server's Entra admin.
 - Product prices are illustrative sample values, not official Microsoft pricing.
 - Product images are generated illustrations; admins can set an `https://` image URL per product.
 - For production consider: Private Endpoints/VNet integration for SQL, Azure Front Door/WAF, Application Insights,

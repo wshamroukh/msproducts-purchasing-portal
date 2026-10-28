@@ -4,9 +4,12 @@
 #
 #  Creates:
 #    - Resource group
-#    - Azure SQL logical server (Microsoft Entra-only auth) + database
+#    - Virtual network with a private endpoint + private DNS zone for SQL
+#    - Azure SQL logical server (Microsoft Entra-only auth, public access DISABLED) + database
 #    - Linux App Service plan + 3 web apps (API, purchasing portal, admin portal)
-#    - System-assigned managed identity for the API -> SQL (no passwords anywhere)
+#    - API web app integrated into the VNet; its system-assigned managed identity
+#      is the SQL Entra admin, so it creates the schema + sample data itself at start-up
+#      (no passwords, no firewall rules, works with "deny public network access" policies)
 #    - 3 Entra ID app registrations (API with scope + Store.Admin app role, 2 SPAs)
 #  Then clones the GitHub repo, builds the apps, creates the schema + sample
 #  data and zip-deploys everything.
@@ -40,6 +43,11 @@ PLAN="asp-${PREFIX}-${SUFFIX}"
 API_APP="app-${PREFIX}-api-${SUFFIX}"
 PORTAL_APP="app-${PREFIX}-portal-${SUFFIX}"
 ADMIN_APP="app-${PREFIX}-admin-${SUFFIX}"
+VNET="vnet-${PREFIX}-${SUFFIX}"
+VNET_CIDR="${VNET_CIDR:-10.20.0.0/16}"
+APP_SUBNET_CIDR="${APP_SUBNET_CIDR:-10.20.1.0/24}"
+PE_SUBNET_CIDR="${PE_SUBNET_CIDR:-10.20.2.0/24}"
+SQL_DNS_ZONE="privatelink.database.windows.net"
 
 WORKDIR="$(mktemp -d)"
 OUT_FILE="${OUT_FILE:-$PWD/deployment-${PREFIX}-${SUFFIX}.env}"
@@ -67,6 +75,9 @@ graph_patch() {
 
 trap 'rm -rf "$WORKDIR"' EXIT
 
+# state file (written as resources are created, so cleanup.sh works even after a failed run)
+save() { echo "$1=$2" >>"$OUT_FILE"; }
+
 # ----------------------------- pre-flight -----------------------------------
 step "Checking prerequisites"
 for t in az git node npm zip curl; do command -v "$t" >/dev/null || die "'$t' is required"; done
@@ -83,6 +94,8 @@ ok "Subscription : $SUB_NAME ($SUB_ID)"
 ok "Tenant       : $TENANT_ID"
 ok "Signed in as : $ME_UPN"
 ok "Location     : $LOCATION   Resource group: $RG"
+: >"$OUT_FILE"; save RG "$RG"; save LOCATION "$LOCATION"
+ok "State file   : $OUT_FILE"
 
 # ----------------------------- source code ----------------------------------
 step "Cloning $REPO_URL ($BRANCH)"
@@ -123,6 +136,7 @@ ok "principalId $API_MI_OID (clientId $API_MI_APPID)"
 # ----------------------------- Entra ID -------------------------------------
 step "Registering the API in Microsoft Entra ID"
 API_CLIENT_ID=$(az ad app create --display-name "${PREFIX}-api-${SUFFIX}" --sign-in-audience AzureADMyOrg --query appId -o tsv)
+save API_CLIENT_ID "$API_CLIENT_ID"
 API_OBJ_ID=$(az ad app show --id "$API_CLIENT_ID" --query id -o tsv)
 SCOPE_ID=$(uuid); ROLE_ID=$(uuid)
 SCOPES_JSON=$(cat <<JSON
@@ -160,9 +174,9 @@ JSON
 }
 
 step "Registering the purchasing portal and admin portal SPAs"
-PORTAL_CLIENT_ID=$(create_spa "${PREFIX}-portal-${SUFFIX}" "$PORTAL_URL")
+PORTAL_CLIENT_ID=$(create_spa "${PREFIX}-portal-${SUFFIX}" "$PORTAL_URL"); save PORTAL_CLIENT_ID "$PORTAL_CLIENT_ID"
 ok "Portal app id $PORTAL_CLIENT_ID"
-ADMIN_CLIENT_ID=$(create_spa "${PREFIX}-admin-${SUFFIX}" "$ADMIN_URL")
+ADMIN_CLIENT_ID=$(create_spa "${PREFIX}-admin-${SUFFIX}" "$ADMIN_URL"); save ADMIN_CLIENT_ID "$ADMIN_CLIENT_ID"
 ok "Admin app id  $ADMIN_CLIENT_ID"
 
 step "Pre-authorizing both SPAs for the API scope"
@@ -199,23 +213,42 @@ for id in "$PORTAL_CLIENT_ID" "$ADMIN_CLIENT_ID"; do
   else warn "Admin consent not granted for $id (users will be asked to consent at first sign-in)"; fi
 done
 
+# ----------------------------- network --------------------------------------
+step "Creating the virtual network"
+az network vnet create -g "$RG" -n "$VNET" -l "$LOCATION" --address-prefixes "$VNET_CIDR" \
+  --subnet-name snet-app --subnet-prefixes "$APP_SUBNET_CIDR" -o none
+az network vnet subnet update -g "$RG" --vnet-name "$VNET" -n snet-app --delegations Microsoft.Web/serverFarms -o none
+az network vnet subnet create -g "$RG" --vnet-name "$VNET" -n snet-pe --address-prefixes "$PE_SUBNET_CIDR" -o none
+ok "$VNET (snet-app $APP_SUBNET_CIDR for App Service, snet-pe $PE_SUBNET_CIDR for private endpoints)"
+
 # ----------------------------- Azure SQL ------------------------------------
-step "Creating Azure SQL server (Entra-only authentication) and database"
+step "Creating Azure SQL server (Entra-only auth, no public access) and database"
+# The API's managed identity is the Entra admin, so the API can create its own schema and sample data.
 az sql server create -g "$RG" -n "$SQL_SERVER" -l "$LOCATION" \
-  --enable-ad-only-auth --external-admin-principal-type User \
-  --external-admin-name "$ME_UPN" --external-admin-sid "$ME_OID" --minimal-tls-version 1.2 -o none
+  --enable-ad-only-auth --external-admin-principal-type Application \
+  --external-admin-name "$API_APP" --external-admin-sid "$API_MI_APPID" \
+  --enable-public-network false --minimal-tls-version 1.2 -o none
 SQL_FQDN=$(az sql server show -g "$RG" -n "$SQL_SERVER" --query fullyQualifiedDomainName -o tsv)
-az sql server firewall-rule create -g "$RG" -s "$SQL_SERVER" -n AllowAzureServices \
-  --start-ip-address 0.0.0.0 --end-ip-address 0.0.0.0 -o none
-MY_IP=$(curl -s --max-time 10 https://api.ipify.org || true)
-if [[ -n "$MY_IP" ]]; then
-  az sql server firewall-rule create -g "$RG" -s "$SQL_SERVER" -n deployer-temp \
-    --start-ip-address "$MY_IP" --end-ip-address "$MY_IP" -o none
-  ok "Temporary firewall rule for this machine ($MY_IP)"
-fi
+SQL_ID=$(az sql server show -g "$RG" -n "$SQL_SERVER" --query id -o tsv)
 az sql db create -g "$RG" -s "$SQL_SERVER" -n "$DB_NAME" --service-objective "$SQL_SKU" \
   --backup-storage-redundancy Local -o none
-ok "$SQL_FQDN / $DB_NAME"
+ok "$SQL_FQDN / $DB_NAME  (Entra admin: managed identity of $API_APP)"
+
+step "Creating the SQL private endpoint and private DNS zone"
+az network private-endpoint create -g "$RG" -n "pe-$SQL_SERVER" -l "$LOCATION" \
+  --vnet-name "$VNET" --subnet snet-pe --private-connection-resource-id "$SQL_ID" \
+  --group-id sqlServer --connection-name "plc-$SQL_SERVER" -o none
+az network private-dns zone create -g "$RG" -n "$SQL_DNS_ZONE" -o none
+az network private-dns link vnet create -g "$RG" -z "$SQL_DNS_ZONE" -n "link-$VNET" \
+  --virtual-network "$VNET" --registration-enabled false -o none
+az network private-endpoint dns-zone-group create -g "$RG" --endpoint-name "pe-$SQL_SERVER" \
+  -n default --private-dns-zone "$SQL_DNS_ZONE" --zone-name sql -o none
+ok "$SQL_FQDN now resolves to a private IP inside $VNET"
+
+step "Connecting the API web app to the virtual network"
+az webapp vnet-integration add -g "$RG" -n "$API_APP" --vnet "$VNET" --subnet snet-app -o none
+az webapp config set -g "$RG" -n "$API_APP" --vnet-route-all-enabled true -o none
+ok "$API_APP -> $VNET/snet-app"
 
 # ----------------------------- build ----------------------------------------
 step "Building the API"
@@ -232,25 +265,12 @@ build_spa() { # <folder>
 step "Building the purchasing portal"; build_spa portal
 step "Building the admin portal";      build_spa admin
 
-# ----------------------------- database -------------------------------------
-step "Creating schema, sample data and the API's database user"
-SQL_TOKEN=$(az account get-access-token --resource https://database.windows.net/ --query accessToken -o tsv)
-db_init() {
-  (cd "$SRC/api" && SQL_SERVER="$SQL_FQDN" SQL_DATABASE="$DB_NAME" SQL_AUTH=access-token SQL_ACCESS_TOKEN="$SQL_TOKEN" \
-    node scripts/db-init.js --seed --grant "$API_APP" --grant-client-id "$API_MI_APPID")
-}
-retry 3 db_init || die "Database initialisation failed"
-ok "Database ready"
-if [[ -n "$MY_IP" ]]; then
-  az sql server firewall-rule delete -g "$RG" -s "$SQL_SERVER" -n deployer-temp -o none && ok "Removed temporary firewall rule"
-fi
-
 # ----------------------------- configure & deploy ----------------------------
 step "Configuring app settings"
 API_SCOPE="api://$API_CLIENT_ID/$SCOPE_NAME"
 az webapp config appsettings set -g "$RG" -n "$API_APP" -o none --settings \
   AUTH_MODE=entra TENANT_ID="$TENANT_ID" API_CLIENT_ID="$API_CLIENT_ID" API_SCOPE_NAME="$SCOPE_NAME" ADMIN_ROLE="$ADMIN_ROLE" \
-  SQL_SERVER="$SQL_FQDN" SQL_DATABASE="$DB_NAME" SQL_AUTH=managed-identity DB_AUTO_INIT=false \
+  SQL_SERVER="$SQL_FQDN" SQL_DATABASE="$DB_NAME" SQL_AUTH=managed-identity DB_AUTO_INIT=true \
   CORS_ORIGINS="$PORTAL_URL,$ADMIN_URL" SCM_DO_BUILD_DURING_DEPLOYMENT=false
 az webapp config set -g "$RG" -n "$API_APP" --startup-file "node src/server.js" -o none
 
@@ -270,7 +290,7 @@ az webapp deploy -g "$RG" -n "$API_APP"    --src-path "$WORKDIR/api.zip"    --ty
 az webapp deploy -g "$RG" -n "$PORTAL_APP" --src-path "$WORKDIR/portal.zip" --type zip -o none && ok "$PORTAL_APP"
 az webapp deploy -g "$RG" -n "$ADMIN_APP"  --src-path "$WORKDIR/admin.zip"  --type zip -o none && ok "$ADMIN_APP"
 
-step "Waiting for the API to report healthy"
+step "Waiting for the API to report healthy (first start creates the tables and sample data)"
 for i in $(seq 1 30); do
   status=$(curl -s -o /dev/null --max-time 20 -w '%{http_code}' "$API_URL/api/health" || true)
   if [[ "$status" == "200" ]]; then ok "API healthy"; break; fi
@@ -280,6 +300,7 @@ done
 
 # ----------------------------- summary --------------------------------------
 cat >"$OUT_FILE" <<ENV
+VNET=$VNET
 RG=$RG
 LOCATION=$LOCATION
 SQL_SERVER=$SQL_FQDN
