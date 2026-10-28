@@ -4,6 +4,7 @@ const { getPool, sql } = require('../db');
 const v = require('../validation');
 const { CATEGORIES, STATUSES, TRANSITIONS } = require('../constants');
 const { getOrderDetail, restoreStock, addHistory } = require('../orderService');
+const { invalidateProducts } = require('../productCache');
 
 const router = express.Router();
 const wrap = (fn) => (req, res, next) => fn(req, res, next).catch(next);
@@ -109,6 +110,7 @@ router.patch('/orders/:id/status', wrap(async (req, res) => {
     if (status === 'Cancelled') await restoreStock(tx, id);
     await addHistory(tx, id, status, historyNote, req.user.email || req.user.name);
     await tx.commit();
+    if (status === 'Cancelled') invalidateProducts(); // stock returned
   } catch (err) {
     await tx.rollback().catch(() => {});
     throw err;
@@ -171,6 +173,7 @@ router.post('/products', wrap(async (req, res) => {
       INSERT INTO dbo.Products (Sku, Name, Category, Description, Price, ImageUrl, Stock, IsActive)
       OUTPUT INSERTED.*
       VALUES (@sku, @name, @category, @description, @price, @imageUrl, @stock, @isActive);`);
+    invalidateProducts();
     res.status(201).json(r.recordset[0]);
   } catch (err) {
     if (isDuplicate(err)) throw new v.ValidationError(`A product with SKU "${p.sku}" already exists`);
@@ -189,6 +192,7 @@ router.put('/products/:id', wrap(async (req, res) => {
       OUTPUT INSERTED.*
       WHERE ProductId = @id;`);
     if (!r.recordset[0]) return res.status(404).json({ error: 'Product not found' });
+    invalidateProducts();
     res.json(r.recordset[0]);
   } catch (err) {
     if (isDuplicate(err)) throw new v.ValidationError(`A product with SKU "${p.sku}" already exists`);

@@ -3,6 +3,7 @@ const express = require('express');
 const { getPool, sql } = require('../db');
 const v = require('../validation');
 const { getOrderDetail, restoreStock, addHistory } = require('../orderService');
+const { invalidateProducts } = require('../productCache');
 
 const router = express.Router();
 
@@ -87,6 +88,7 @@ router.post('/', async (req, res, next) => {
     await addHistory(tx, created.OrderId, 'Submitted', 'Order placed from the purchasing portal', req.user.email || req.user.name);
     await tx.commit();
     tx = null;
+    invalidateProducts(); // stock changed
 
     res.status(201).json({ orderId: created.OrderId, orderNumber: created.OrderNumber, total });
   } catch (err) {
@@ -148,6 +150,7 @@ router.post('/:id/cancel', async (req, res, next) => {
     await addHistory(tx, id, 'Cancelled', 'Cancelled by requester', req.user.email || req.user.name);
     await tx.commit();
     tx = null;
+    invalidateProducts(); // stock returned
     res.json(await getOrderDetail(pool, id, { userOid: req.user.oid }));
   } catch (err) {
     if (tx) await tx.rollback().catch(() => {});

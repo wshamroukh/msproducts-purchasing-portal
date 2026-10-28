@@ -17,6 +17,10 @@ const path = require('path');
 const PORT = process.env.PORT || 8080;
 const DIST = path.join(__dirname, 'dist');
 const PROXY_TARGET = process.env.API_PROXY_TARGET ? new URL(process.env.API_PROXY_TARGET) : null;
+// Re-use connections to the API (keep-alive) instead of a new TCP + TLS handshake per request
+const PROXY_AGENT = PROXY_TARGET
+  ? new (PROXY_TARGET.protocol === 'https:' ? https : http).Agent({ keepAlive: true, maxSockets: 64, keepAliveMsecs: 30000 })
+  : null;
 const TYPES = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg',
@@ -67,6 +71,7 @@ function proxyToApi(req, res) {
       method: req.method,
       path: req.url,
       headers,
+      agent: PROXY_AGENT,
       timeout: 60000,
     },
     (up) => {

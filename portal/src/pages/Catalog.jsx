@@ -1,29 +1,50 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { useApi } from '../lib/useApi';
+import { api } from '../lib/api';
 import { useCart } from '../lib/cart';
 import { money } from '../lib/format';
 import ProductArt from '../components/ProductArt';
 import { Empty, ErrorBox, Spinner } from '../components/Common';
 
 const CATEGORIES = ['All', 'Hardware', 'Software', 'Accessories'];
+const CACHE_KEY = 'msstore.catalog.v1';
+
+// The whole catalog is loaded once and filtered in the browser, so switching tabs and searching
+// is instant. The last catalog is kept for the browser session and shown immediately on the next
+// visit while a fresh copy is fetched in the background (stale-while-revalidate).
+function useCatalog() {
+  const [products, setProducts] = useState(() => {
+    try { return JSON.parse(sessionStorage.getItem(CACHE_KEY)); } catch { return null; }
+  });
+  const [error, setError] = useState(null);
+  const load = useCallback(() => {
+    setError(null);
+    api('/api/products')
+      .then((data) => {
+        setProducts(data);
+        try { sessionStorage.setItem(CACHE_KEY, JSON.stringify(data)); } catch { /* storage full */ }
+      })
+      .catch(setError);
+  }, []);
+  useEffect(() => load(), [load]);
+  return { products, error, reload: load };
+}
+
 
 export default function Catalog() {
   const [category, setCategory] = useState('All');
   const [search, setSearch] = useState('');
-  const [query, setQuery] = useState('');
   const [toast, setToast] = useState('');
   const cart = useCart();
 
-  useEffect(() => {
-    const t = setTimeout(() => setQuery(search.trim()), 300);
-    return () => clearTimeout(t);
-  }, [search]);
-
-  const params = new URLSearchParams();
-  if (category !== 'All') params.set('category', category);
-  if (query) params.set('q', query);
-  const { data, error, loading, reload } = useApi(`/api/products?${params}`);
+  const { products, error, reload } = useCatalog();
+  const data = useMemo(() => {
+    if (!products) return null;
+    const q = search.trim().toLowerCase();
+    return products.filter((p) =>
+      (category === 'All' || p.Category === category)
+      && (!q || `${p.Name} ${p.Description || ''} ${p.Sku}`.toLowerCase().includes(q)));
+  }, [products, category, search]);
 
   const add = (p) => {
     cart.add(p, 1);
@@ -52,7 +73,7 @@ export default function Catalog() {
       </div>
 
       <ErrorBox error={error} onRetry={reload} />
-      {loading && !data ? (
+      {!data && !error ? (
         <Spinner label="Loading products…" />
       ) : data && data.length === 0 ? (
         <Empty title="No products found">Try another category or search term.</Empty>
