@@ -1,0 +1,9 @@
+{
+  "appTitle": "Microsoft Products Purchasing Portal",
+  "authMode": "dev",
+  "tenantId": "",
+  "clientId": "",
+  "apiScope": "",
+  "apiBaseUrl": "http://localhost:3000",
+  "devAdmin": false
+}

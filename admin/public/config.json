@@ -1,0 +1,9 @@
+{
+  "appTitle": "Purchasing Portal – Admin",
+  "authMode": "dev",
+  "tenantId": "",
+  "clientId": "",
+  "apiScope": "",
+  "apiBaseUrl": "http://localhost:3000",
+  "devAdmin": true
+}

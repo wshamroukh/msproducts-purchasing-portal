@@ -1,0 +1,20 @@
+{
+  "name": "msstore-api",
+  "version": "1.0.0",
+  "description": "Backend API for the internal Microsoft Products Purchasing Portal",
+  "main": "src/server.js",
+  "private": true,
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "db:init": "node scripts/db-init.js --seed",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "mssql": "^11.0.1"
+  }
+}

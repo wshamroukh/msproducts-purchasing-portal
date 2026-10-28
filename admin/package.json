@@ -1,0 +1,23 @@
+{
+  "name": "msstore-admin",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Admin portal (SPA) - process orders, dispatch to stores, manage products",
+  "scripts": {
+    "dev": "vite --port 5174",
+    "build": "vite build",
+    "preview": "vite preview --port 5174",
+    "start": "node server.cjs"
+  },
+  "dependencies": {
+    "@azure/msal-browser": "^4.12.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-router-dom": "^7.6.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^5.0.0",
+    "vite": "^7.0.0"
+  }
+}
