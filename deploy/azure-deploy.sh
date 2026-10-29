@@ -13,6 +13,9 @@
 #      is the SQL Entra admin, so it creates the schema + sample data itself at start-up
 #      (no passwords, no firewall rules, works with "deny public network access" policies)
 #    - 3 Entra ID app registrations (API with scope + Store.Admin app role, 2 SPAs)
+#    - Order PDFs: Storage account (no public access, no keys; private endpoints for blob/queue/table)
+#      + Function App on the same plan (VNet integrated, managed identity). The API queues order
+#      snapshots, the function renders PDFs into blob storage, the API serves them to requesters.
 #    - Log Analytics workspace (container/HTTP/platform logs of all 3 apps) and a workspace-based
 #      Application Insights resource with Node.js auto-instrumentation on all 3 apps
 #      (requests, dependencies incl. portal -> API calls, exceptions, live metrics, application map)
@@ -170,7 +173,7 @@ ensure_providers() {
   done
 }
 step "Checking resource providers"
-ensure_providers Microsoft.Web Microsoft.Sql Microsoft.Network Microsoft.OperationalInsights Microsoft.Insights
+ensure_providers Microsoft.Web Microsoft.Sql Microsoft.Network Microsoft.OperationalInsights Microsoft.Insights Microsoft.Storage
 ok "all required resource providers are registered"
 
 TENANT_ID=$(az account show --query tenantId -o tsv)
@@ -197,10 +200,18 @@ build_spa() { # <folder>
   (cd "$SRC/$1" && zip -qr "$WORKDIR/$1.zip" dist server.cjs)
   ok "$1.zip"
 }
+build_functions() {
+  [[ -d "$SRC/functions" ]] || { warn "functions/ folder not found in the repo - skipping the PDF function"; return 0; }
+  step "Building the order-PDF function"
+  (cd "$SRC/functions" && npm install --omit=dev --no-audit --no-fund --loglevel=error)
+  (cd "$SRC/functions" && zip -qr "$WORKDIR/functions.zip" host.json package.json src node_modules)
+  ok "functions.zip"
+}
 build_all() {
   build_api
   step "Building the purchasing portal"; build_spa portal
   step "Building the admin portal";      build_spa admin
+  if [[ -n "${FUNC_APP:-}" ]]; then build_functions; fi
 }
 
 # Zip deploy with retries. Kudu often answers 502 for a minute or two after app settings,
@@ -229,6 +240,7 @@ deploy_all() {
   deploy_zip "$API_APP"    "$WORKDIR/api.zip"
   deploy_zip "$PORTAL_APP" "$WORKDIR/portal.zip"
   deploy_zip "$ADMIN_APP"  "$WORKDIR/admin.zip"
+  if [[ -n "${FUNC_APP:-}" && -f "$WORKDIR/functions.zip" ]]; then deploy_zip "$FUNC_APP" "$WORKDIR/functions.zip"; fi
 }
 
 # Public access to the API web app.
@@ -296,6 +308,122 @@ ensure_appinsights() {
   done
 }
 
+# ---- Order PDF service: Storage account + Function App ------------------------------------------
+# Everything is identity based: the storage account has shared keys and public network access
+# disabled; the Function App and the API reach it through private endpoints with their managed
+# identities. Idempotent - safe on new and existing environments.
+ensure_private_dns_zone() { # <zone> <vnet>
+  local zone=$1 vnet=$2
+  az network private-dns zone show -g "$RG" -n "$zone" -o none 2>/dev/null || az network private-dns zone create -g "$RG" -n "$zone" -o none
+  az network private-dns link vnet show -g "$RG" -z "$zone" -n "link-$vnet" -o none 2>/dev/null || \
+    az network private-dns link vnet create -g "$RG" -z "$zone" -n "link-$vnet" --virtual-network "$vnet" --registration-enabled false -o none
+}
+
+ensure_pdf_service() {
+  step "Order PDF service (Storage account + Function App)"
+  local loc vnet plan_id sa sa_id sub pe fn fn_mi api_mi role tmp
+  loc=$(az group show -n "$RG" --query location -o tsv)
+  vnet=$(az network vnet list -g "$RG" --query "[0].name" -o tsv)
+  [[ -n "$vnet" ]] || die "No virtual network found in $RG"
+  plan_id=$(az webapp show -g "$RG" -n "$API_APP" --query appServicePlanId -o tsv)
+  [[ -n "$plan_id" ]] || plan_id=$(az webapp show -g "$RG" -n "$API_APP" --query serverFarmId -o tsv)
+  az network vnet subnet show -g "$RG" --vnet-name "$vnet" -n snet-pe -o none 2>/dev/null || die "Subnet snet-pe not found in $vnet"
+
+  # -- storage account
+  sa=$(az storage account list -g "$RG" --query "[?tags.purpose=='order-pdfs'].name | [0]" -o tsv)
+  if [[ -z "$sa" ]]; then
+    sa=$(echo "st${RG#rg-}pdf" | tr -cd 'a-z0-9' | cut -c1-24)
+    az storage account create -g "$RG" -n "$sa" -l "$loc" --sku Standard_LRS --kind StorageV2 \
+      --min-tls-version TLS1_2 --https-only true --allow-blob-public-access false \
+      --allow-shared-key-access false --public-network-access Disabled --tags purpose=order-pdfs -o none
+    ok "created storage account $sa (no public access, no shared keys)"
+  else
+    ok "reusing storage account $sa"
+  fi
+  sa_id=$(az storage account show -g "$RG" -n "$sa" --query id -o tsv)
+  # container + queue through the management plane (the data plane is private)
+  for tmp in "blobServices/default/containers/order-pdfs" "queueServices/default/queues/order-pdf-requests"; do
+    az rest --method put --uri "https://management.azure.com${sa_id}/${tmp}?api-version=2023-05-01" \
+      --headers "Content-Type=application/json" --body '{"properties":{}}' --only-show-errors -o none
+  done
+  ok "container order-pdfs and queue order-pdf-requests ready"
+  # Old PDF versions are removed after 30 days (a missing PDF is regenerated on demand)
+  tmp="$WORKDIR/lifecycle.json"
+  cat >"$tmp" <<'JSON'
+{"rules":[{"enabled":true,"name":"delete-old-order-pdfs","type":"Lifecycle","definition":{
+  "actions":{"baseBlob":{"delete":{"daysAfterModificationGreaterThan":30}}},
+  "filters":{"blobTypes":["blockBlob"],"prefixMatch":["order-pdfs/"]}}}]}
+JSON
+  if az storage account management-policy create -g "$RG" --account-name "$sa" --policy @"$tmp" -o none; then
+    ok "lifecycle rule: PDFs older than 30 days are deleted"
+  else
+    warn "could not set the lifecycle rule (not required)"
+  fi
+
+  # -- private endpoints: blob + queue for the app data, table for the Functions host
+  for sub in blob queue table; do
+    pe="pe-$sa-$sub"
+    if ! az network private-endpoint show -g "$RG" -n "$pe" -o none 2>/dev/null; then
+      az network private-endpoint create -g "$RG" -n "$pe" -l "$loc" --vnet-name "$vnet" --subnet snet-pe \
+        --private-connection-resource-id "$sa_id" --group-id "$sub" --connection-name "plc-$sa-$sub" -o none
+    fi
+    ensure_private_dns_zone "privatelink.$sub.core.windows.net" "$vnet"
+    az network private-endpoint dns-zone-group show -g "$RG" --endpoint-name "$pe" -n default -o none 2>/dev/null || \
+      az network private-endpoint dns-zone-group create -g "$RG" --endpoint-name "$pe" -n default \
+        --private-dns-zone "privatelink.$sub.core.windows.net" --zone-name "$sub" -o none
+  done
+  ok "private endpoints for blob, queue and table"
+
+  # -- function app on the same App Service plan
+  fn=$(az functionapp list -g "$RG" --query "[?tags.purpose=='order-pdfs'].name | [0]" -o tsv)
+  if [[ -z "$fn" ]]; then
+    fn="func-${RG#rg-}-pdf"
+    az functionapp create -g "$RG" -n "$fn" -p "$plan_id" --storage-account "$sa" --os-type Linux \
+      --runtime node --runtime-version 22 --functions-version 4 --tags purpose=order-pdfs -o none
+    ok "created function app $fn"
+  else
+    ok "reusing function app $fn"
+  fi
+  FUNC_APP="$fn"
+  fn_mi=$(az functionapp identity assign -g "$RG" -n "$fn" --query principalId -o tsv)
+  api_mi=$(az webapp identity show -g "$RG" -n "$API_APP" --query principalId -o tsv)
+
+  # -- RBAC on the storage account (no keys anywhere)
+  for role in "Storage Blob Data Owner" "Storage Queue Data Contributor" "Storage Table Data Contributor"; do
+    az role assignment create --assignee-object-id "$fn_mi" --assignee-principal-type ServicePrincipal \
+      --role "$role" --scope "$sa_id" -o none 2>/dev/null || true
+  done
+  for role in "Storage Queue Data Message Sender" "Storage Blob Data Reader"; do
+    az role assignment create --assignee-object-id "$api_mi" --assignee-principal-type ServicePrincipal \
+      --role "$role" --scope "$sa_id" -o none 2>/dev/null || true
+  done
+  ok "roles: function (blob/queue/table data), API (queue sender, blob reader)"
+
+  # -- function app settings: identity-based storage for the host and for the PDF bindings
+  az functionapp config appsettings delete -g "$RG" -n "$fn" --setting-names AzureWebJobsStorage -o none 2>/dev/null || true
+  local fn_settings=(AzureWebJobsStorage__accountName="$sa"
+    PdfStorage__blobServiceUri="https://$sa.blob.core.windows.net"
+    PdfStorage__queueServiceUri="https://$sa.queue.core.windows.net"
+    FUNCTIONS_WORKER_RUNTIME=node WEBSITE_RUN_FROM_PACKAGE=1 SCM_DO_BUILD_DURING_DEPLOYMENT=false)
+  if [[ -n "${AI_CS:-}" ]]; then fn_settings+=(APPLICATIONINSIGHTS_CONNECTION_STRING="$AI_CS"); fi
+  az functionapp config appsettings set -g "$RG" -n "$fn" -o none --settings "${fn_settings[@]}"
+  az functionapp update -g "$RG" -n "$fn" --set httpsOnly=true -o none
+  az webapp config set -g "$RG" -n "$fn" -o none --always-on true --ftps-state Disabled --min-tls-version 1.2 \
+    --vnet-route-all-enabled true
+  if [[ -z "$(az functionapp vnet-integration list -g "$RG" -n "$fn" --query "[0].name" -o tsv 2>/dev/null)" ]]; then
+    az functionapp vnet-integration add -g "$RG" -n "$fn" --vnet "$vnet" --subnet snet-app -o none
+  fi
+  # No HTTP triggers: block the main site from the internet. The deployment (SCM) site stays
+  # reachable so this script can deploy (it requires Entra ID sign-in).
+  az webapp config set -g "$RG" -n "$fn" -o none --generic-configurations \
+    '{"ipSecurityRestrictionsDefaultAction":"Deny","scmIpSecurityRestrictionsDefaultAction":"Allow","scmIpSecurityRestrictionsUseMain":false}'
+  ok "$fn: VNet integrated, managed identity, inbound blocked"
+
+  az webapp config appsettings set -g "$RG" -n "$API_APP" -o none --settings PDF_STORAGE_ACCOUNT="$sa"
+  ok "API configured to queue and serve PDFs from $sa"
+  PDF_STORAGE="$sa"
+}
+
 wait_healthy() { # <health url>
   # The API itself is private (403 from the internet), so this is called with the PORTAL's /api/health:
   # browser/curl -> portal web app -> (VNet integration) -> API private endpoint -> API -> SQL private endpoint.
@@ -338,6 +466,7 @@ if [[ -n "${REDEPLOY_RG:-}" ]]; then
   done
   ensure_logging
   ensure_appinsights
+  ensure_pdf_service
   build_all
   API_LOCKED=0
   if az network private-endpoint show -g "$RG" -n "pe-$API_APP" -o none 2>/dev/null; then
@@ -539,6 +668,7 @@ ok "done"
 
 ensure_logging
 ensure_appinsights
+ensure_pdf_service
 # building takes a few minutes, which also gives the sites time to restart after the settings change
 build_all
 deploy_all      # the API is still publicly reachable at this point, so zip deploy works
@@ -565,6 +695,8 @@ wait_healthy "$PORTAL_URL/api/health"
 
 # ----------------------------- summary --------------------------------------
 cat >"$OUT_FILE" <<ENV
+FUNC_APP=$FUNC_APP
+PDF_STORAGE=$PDF_STORAGE
 APP_INSIGHTS=$AI_NAME
 VNET=$VNET
 RG=$RG
@@ -590,6 +722,7 @@ echo "  Purchasing portal : $PORTAL_URL"
 echo "  Admin portal      : $ADMIN_URL   ($ME_UPN has the $ADMIN_ROLE role)"
 echo "  API health        : $PORTAL_URL/api/health   (API itself is private: $API_URL)"
 echo "  Settings saved to : $OUT_FILE   (used by cleanup.sh)"
+echo "  Order PDFs        : $FUNC_APP -> storage $PDF_STORAGE (container order-pdfs)"
 echo "  App Insights      : Azure portal -> $AI_NAME (Application map, Live metrics, Performance, Failures)"
 echo "  API logs          : az monitor log-analytics query -w $LAW_GUID -o table --analytics-query \"AppServiceConsoleLogs | where _ResourceId contains '${API_APP}' | top 50 by TimeGenerated | project TimeGenerated, ResultDescription\""
 echo

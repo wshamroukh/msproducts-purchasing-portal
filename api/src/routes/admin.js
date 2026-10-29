@@ -5,6 +5,7 @@ const v = require('../validation');
 const { CATEGORIES, STATUSES, TRANSITIONS } = require('../constants');
 const { getOrderDetail, restoreStock, addHistory } = require('../orderService');
 const { invalidateProducts } = require('../productCache');
+const pdf = require('../pdfService');
 
 const router = express.Router();
 const wrap = (fn) => (req, res, next) => fn(req, res, next).catch(next);
@@ -89,6 +90,13 @@ router.get('/orders/:id', wrap(async (req, res) => {
   res.json({ ...order, allowedTransitions: TRANSITIONS[order.Status] || [] });
 }));
 
+router.get('/orders/:id/pdf', wrap(async (req, res) => {
+  const id = v.int(req.params.id, 'id', { required: true, min: 1 });
+  const order = await getOrderDetail(await getPool(), id);
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+  await pdf.sendOrderPdf(res, order);
+}));
+
 // PATCH /api/admin/orders/:id/status  { status, storeId?, trackingNumber?, note? }
 router.patch('/orders/:id/status', wrap(async (req, res) => {
   const id = v.int(req.params.id, 'id', { required: true, min: 1 });
@@ -139,6 +147,7 @@ router.patch('/orders/:id/status', wrap(async (req, res) => {
     throw err;
   }
   const order = await getOrderDetail(pool, id);
+  pdf.requestPdf(order).catch((err) => console.error(`[pdf] could not queue PDF for order ${id}: ${err.message}`));
   res.json({ ...order, allowedTransitions: TRANSITIONS[order.Status] || [] });
 }));
 

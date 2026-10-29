@@ -6,3 +6,4 @@ deployment-*.env
 .DS_Store
 *.log
 .vscode/
+local.settings.json

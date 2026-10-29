@@ -4,6 +4,7 @@ import { useApi } from '../lib/useApi';
 import { api } from '../lib/api';
 import { dateTime, money, STATUS_LABELS } from '../lib/format';
 import ProductArt from '../components/ProductArt';
+import PdfButton from '../components/PdfButton';
 import { ErrorBox, Spinner, StatusBadge, StatusTracker } from '../components/Common';
 
 export default function OrderDetail() {
@@ -75,6 +76,7 @@ export default function OrderDetail() {
           <p><span className="muted small">Cost center</span><br />{o.CostCenter}</p>
           {o.Justification && <p><span className="muted small">Justification</span><br />{o.Justification}</p>}
           <p className="muted small">Placed {dateTime(o.CreatedAt)}</p>
+          <PdfButton path={`/api/orders/${o.OrderId}/pdf`} filename={`${o.OrderNumber}.pdf`} block />
           <ErrorBox error={actionError} />
           {o.Status === 'Submitted' && (
             <button className="btn btn-danger btn-block" disabled={busy} onClick={cancel}>{busy ? 'Cancelling…' : 'Cancel order'}</button>

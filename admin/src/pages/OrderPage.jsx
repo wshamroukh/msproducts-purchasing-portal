@@ -4,6 +4,7 @@ import { useApi } from '../lib/useApi';
 import { api } from '../lib/api';
 import { dateTime, money, STATUS_LABELS } from '../lib/format';
 import ProductArt from '../components/ProductArt';
+import PdfButton from '../components/PdfButton';
 import { ErrorBox, Spinner, StatusBadge, StatusTracker } from '../components/Common';
 
 function Actions({ order, onUpdated }) {
@@ -97,7 +98,10 @@ export default function OrderPage() {
         <h1>Order {o.OrderNumber}</h1>
         <StatusBadge status={o.Status} />
         <span className="spacer" />
-        {o.StoreName && <button className="btn" onClick={() => window.print()}>Print dispatch slip</button>}
+        <div className="inline-actions">
+          <PdfButton path={`/api/admin/orders/${o.OrderId}/pdf`} filename={`${o.OrderNumber}.pdf`} />
+          {o.StoreName && <button className="btn" onClick={() => window.print()}>Print dispatch slip</button>}
+        </div>
       </div>
       <StatusTracker status={o.Status} />
 

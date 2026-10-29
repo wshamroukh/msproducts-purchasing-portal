@@ -1,0 +1,17 @@
+{
+  "name": "msstore-order-pdf",
+  "version": "1.0.0",
+  "description": "Azure Function: renders purchase-order PDFs from a queue and stores them in Blob Storage",
+  "private": true,
+  "main": "src/functions/*.js",
+  "scripts": {
+    "start": "func start",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@azure/functions": "^4.6.0"
+  }
+}

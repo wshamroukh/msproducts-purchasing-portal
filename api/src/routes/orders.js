@@ -4,6 +4,7 @@ const { getPool, sql, withTransaction } = require('../db');
 const v = require('../validation');
 const { getOrderDetail, restoreStock, addHistory } = require('../orderService');
 const { invalidateProducts } = require('../productCache');
+const pdf = require('../pdfService');
 
 const router = express.Router();
 
@@ -90,6 +91,7 @@ router.post('/', async (req, res, next) => {
       return { created, total };
     }, { isolationLevel: sql.ISOLATION_LEVEL.READ_COMMITTED });
     invalidateProducts(); // stock changed
+    pdf.queueOrderPdf(pool, created.OrderId);
 
     res.status(201).json({ orderId: created.OrderId, orderNumber: created.OrderNumber, total });
   } catch (err) {
@@ -124,6 +126,18 @@ router.get('/:id', async (req, res, next) => {
   }
 });
 
+// GET /api/orders/:id/pdf  - PDF of one of my orders (202 while it is being generated)
+router.get('/:id/pdf', async (req, res, next) => {
+  try {
+    const id = v.int(req.params.id, 'id', { required: true, min: 1 });
+    const order = await getOrderDetail(await getPool(), id, { userOid: req.user.oid });
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    await pdf.sendOrderPdf(res, order);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // POST /api/orders/:id/cancel  - requester can cancel while still "Submitted"
 router.post('/:id/cancel', async (req, res, next) => {
   try {
@@ -146,6 +160,7 @@ router.post('/:id/cancel', async (req, res, next) => {
     });
     if (!found) return res.status(404).json({ error: 'Order not found' });
     invalidateProducts(); // stock returned
+    pdf.queueOrderPdf(pool, id);
     res.json(await getOrderDetail(pool, id, { userOid: req.user.oid }));
   } catch (err) {
     next(err);
