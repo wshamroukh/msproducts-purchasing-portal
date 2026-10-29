@@ -62,4 +62,32 @@ async function getPool() {
   return poolPromise;
 }
 
-module.exports = { sql, getPool, buildSqlConfig };
+// SQL Server errors that are safe to retry: 1205 deadlock victim, 1222 lock request timeout
+const TRANSIENT = new Set([1205, 1222]);
+const isTransient = (err) => !!err && (TRANSIENT.has(err.number) || TRANSIENT.has(err.originalError && err.originalError.info && err.originalError.info.number));
+
+/**
+ * Runs fn(tx) in a transaction and commits. On a deadlock / lock timeout the whole
+ * transaction is rolled back and retried (up to `retries` times, with jittered back-off).
+ */
+async function withTransaction(pool, fn, { retries = 3, isolationLevel } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    const tx = new sql.Transaction(pool);
+    await (isolationLevel !== undefined ? tx.begin(isolationLevel) : tx.begin());
+    try {
+      const result = await fn(tx);
+      await tx.commit();
+      return result;
+    } catch (err) {
+      await tx.rollback().catch(() => {});
+      if (attempt < retries && isTransient(err)) {
+        console.warn(`[db] transient error ${err.number} (${err.message}) - retry ${attempt + 1}/${retries}`);
+        await new Promise((r) => setTimeout(r, 50 * 2 ** attempt + Math.random() * 100));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+module.exports = { sql, getPool, buildSqlConfig, withTransaction, isTransient };
