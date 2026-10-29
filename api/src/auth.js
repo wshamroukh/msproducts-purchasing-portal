@@ -93,6 +93,28 @@ function userFromClaims(claims) {
   };
 }
 
+/**
+ * Load testing: an app-only (client credentials) token from an allow-listed load-test client
+ * may act as a synthetic shopper named by the x-loadtest-user header. Synthetic users get the
+ * "loadtest-" prefix, are never admins and only see their own orders.
+ * Returns the synthetic user, or null when the token is not a load-test token.
+ */
+function loadTestUserFromClaims(claims, headerValue, allowedClientIds) {
+  const clientId = String(claims.azp || claims.appid || '').toLowerCase();
+  const appOnly = claims.idtyp === 'app' || (!claims.scp && claims.oid && claims.oid === claims.sub);
+  if (!appOnly || !clientId || !allowedClientIds.includes(clientId)) return null;
+  const id = String(headerValue || 'default');
+  if (!/^[A-Za-z0-9-]{1,40}$/.test(id)) throw new AuthError('Invalid x-loadtest-user header', 400);
+  return {
+    oid: `loadtest-${id}`,
+    name: `Load Test ${id}`,
+    email: `${id}@loadtest.invalid`,
+    roles: [],
+    scopes: [config.auth.scopeName],
+    isLoadTest: true,
+  };
+}
+
 /** Express middleware - every /api route except /api/health uses this. */
 function requireUser(req, res, next) {
   if (config.auth.mode === 'dev') {
@@ -113,6 +135,11 @@ function requireUser(req, res, next) {
 
   verifyToken(m[1], { tenantId: config.auth.tenantId, clientId: config.auth.clientId })
     .then((claims) => {
+      const synthetic = loadTestUserFromClaims(claims, req.get('x-loadtest-user'), config.auth.loadTestClientIds);
+      if (synthetic) {
+        req.user = synthetic;
+        return next();
+      }
       const user = userFromClaims(claims);
       if (!user.oid) throw new AuthError('Token has no user (oid) claim', 403);
       if (!user.scopes.includes(config.auth.scopeName)) {
@@ -139,4 +166,4 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-module.exports = { requireUser, requireAdmin, isAdmin, verifyToken, userFromClaims, AuthError, _getSigningKey: getSigningKey };
+module.exports = { requireUser, requireAdmin, isAdmin, verifyToken, userFromClaims, loadTestUserFromClaims, AuthError, _getSigningKey: getSigningKey };

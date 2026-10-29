@@ -22,6 +22,9 @@ const config = {
     clientId: process.env.API_CLIENT_ID || '',
     scopeName: process.env.API_SCOPE_NAME || 'access_as_user',
     adminRole: process.env.ADMIN_ROLE || 'Store.Admin',
+    // Client ids (app registrations) allowed to call the API with app-only tokens to simulate
+    // shoppers during load tests. Empty = load-test access disabled.
+    loadTestClientIds: (process.env.LOADTEST_CLIENT_IDS || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
   },
   sql: {
     server: process.env.SQL_SERVER || 'localhost',
