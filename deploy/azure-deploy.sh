@@ -13,6 +13,9 @@
 #      is the SQL Entra admin, so it creates the schema + sample data itself at start-up
 #      (no passwords, no firewall rules, works with "deny public network access" policies)
 #    - 3 Entra ID app registrations (API with scope + Store.Admin app role, 2 SPAs)
+#    - Log Analytics workspace (container/HTTP/platform logs of all 3 apps) and a workspace-based
+#      Application Insights resource with Node.js auto-instrumentation on all 3 apps
+#      (requests, dependencies incl. portal -> API calls, exceptions, live metrics, application map)
 #  Then clones the GitHub repo, builds the apps, creates the schema + sample
 #  data and zip-deploys everything.
 #
@@ -149,6 +152,27 @@ if [[ -n "$SUBSCRIPTION" ]]; then
   az account set --subscription "$SUBSCRIPTION"
 fi
 
+# ----------------------------- resource providers ---------------------------
+ensure_providers() {
+  local ns state i
+  for ns in "$@"; do
+    state=$(az provider show -n "$ns" --query registrationState -o tsv 2>/dev/null || echo NotRegistered)
+    if [[ "$state" == "Registered" ]]; then continue; fi
+    warn "Registering resource provider $ns (current state: $state)…"
+    az provider register -n "$ns" -o none
+    for ((i = 1; i <= 60; i++)); do
+      state=$(az provider show -n "$ns" --query registrationState -o tsv)
+      [[ "$state" == "Registered" ]] && break
+      sleep 10
+    done
+    [[ "$state" == "Registered" ]] || die "$ns is still '$state' after 10 minutes - check: az provider show -n $ns"
+    ok "$ns registered"
+  done
+}
+step "Checking resource providers"
+ensure_providers Microsoft.Web Microsoft.Sql Microsoft.Network Microsoft.OperationalInsights Microsoft.Insights
+ok "all required resource providers are registered"
+
 TENANT_ID=$(az account show --query tenantId -o tsv)
 SUB_ID=$(az account show --query id -o tsv)
 SUB_NAME=$(az account show --query name -o tsv)
@@ -223,6 +247,55 @@ api_access() { # open|lock
   fi
 }
 
+# Central logging. The API is private (its log stream / Kudu site is blocked), so container
+# stdout, HTTP and platform logs of all 3 apps are sent to a Log Analytics workspace instead.
+ensure_logging() {
+  step "Sending app logs to Log Analytics"
+  az config set extension.use_dynamic_install=yes_without_prompt -o none 2>/dev/null || true
+  local law="log-${RG#rg-}" app id
+  az monitor log-analytics workspace create -g "$RG" -n "$law" -l "$(az group show -n "$RG" --query location -o tsv)" -o none
+  LAW_ID=$(az monitor log-analytics workspace show -g "$RG" -n "$law" --query id -o tsv)
+  LAW_GUID=$(az monitor log-analytics workspace show -g "$RG" -n "$law" --query customerId -o tsv)
+  for app in "$API_APP" "$PORTAL_APP" "$ADMIN_APP"; do
+    id=$(az webapp show -g "$RG" -n "$app" --query id -o tsv)
+    if az monitor diagnostic-settings create -n to-log-analytics --resource "$id" --workspace "$LAW_ID" -o none \
+         --logs '[{"category":"AppServiceConsoleLogs","enabled":true},{"category":"AppServiceHTTPLogs","enabled":true},{"category":"AppServicePlatformLogs","enabled":true}]' 2>/dev/null; then
+      ok "$app -> $law"
+    else
+      warn "Could not configure diagnostic settings for $app (it may already exist)"
+    fi
+  done
+  ok "Query the API logs with:  az monitor log-analytics query -w $LAW_GUID -o table --analytics-query \"AppServiceConsoleLogs | where _ResourceId contains '${API_APP}' | top 50 by TimeGenerated | project TimeGenerated, ResultDescription\""
+}
+
+# Application Insights (workspace-based, same Log Analytics workspace). The Node.js agent built into
+# App Service on Linux is switched on with two app settings - no code changes, no SDK in package.json.
+ensure_appinsights() {
+  step "Application Insights"
+  local ai="appi-${RG#rg-}" app pna
+  az extension add --name application-insights -o none 2>/dev/null || true
+  if ! az monitor app-insights component show -g "$RG" --app "$ai" -o none 2>/dev/null; then
+    az monitor app-insights component create -g "$RG" --app "$ai" -l "$(az group show -n "$RG" --query location -o tsv)" \
+      --kind web --application-type Node.JS --workspace "$LAW_ID" -o none
+    ok "created $ai (data stored in the Log Analytics workspace)"
+  else
+    ok "reusing $ai"
+  fi
+  AI_NAME="$ai"
+  AI_CS=$(az monitor app-insights component show -g "$RG" --app "$ai" --query connectionString -o tsv)
+  [[ -n "$AI_CS" ]] || die "Could not read the Application Insights connection string"
+  pna=$(az monitor app-insights component show -g "$RG" --app "$ai" --query publicNetworkAccessForIngestion -o tsv 2>/dev/null || true)
+  if [[ "$pna" == "Disabled" ]]; then
+    warn "Public ingestion is disabled on $ai (subscription policy?) - telemetry only arrives through an"
+    warn "Azure Monitor Private Link Scope. Without one, Application Insights will stay empty."
+  fi
+  for app in "$API_APP" "$PORTAL_APP" "$ADMIN_APP"; do
+    az webapp config appsettings set -g "$RG" -n "$app" -o none --settings \
+      APPLICATIONINSIGHTS_CONNECTION_STRING="$AI_CS" ApplicationInsightsAgent_EXTENSION_VERSION="~3"
+    ok "$app -> $ai (auto-instrumentation on)"
+  done
+}
+
 wait_healthy() { # <health url>
   # The API itself is private (403 from the internet), so this is called with the PORTAL's /api/health:
   # browser/curl -> portal web app -> (VNet integration) -> API private endpoint -> API -> SQL private endpoint.
@@ -263,6 +336,8 @@ if [[ -n "${REDEPLOY_RG:-}" ]]; then
   for app in "$API_APP" "$PORTAL_APP" "$ADMIN_APP"; do
     az webapp config appsettings set -g "$RG" -n "$app" -o none --settings WEBSITE_RUN_FROM_PACKAGE=1 SCM_DO_BUILD_DURING_DEPLOYMENT=false
   done
+  ensure_logging
+  ensure_appinsights
   build_all
   API_LOCKED=0
   if az network private-endpoint show -g "$RG" -n "pe-$API_APP" -o none 2>/dev/null; then
@@ -283,6 +358,7 @@ if [[ -n "${REDEPLOY_RG:-}" ]]; then
   PROXY=$(az webapp config appsettings list -g "$RG" -n "$PORTAL_APP" --query "[?name=='API_PROXY_TARGET'].value | [0]" -o tsv)
   if [[ -n "$PROXY" ]]; then wait_healthy "$PORTAL_URL/api/health"; else wait_healthy "$API_URL/api/health"; fi
   echo -e "\n${c_ok}Redeploy complete:${c_off} $PORTAL_URL"
+  echo "  App Insights: Azure portal -> $AI_NAME (Application map, Live metrics, Performance, Failures)"
   exit 0
 fi
 
@@ -461,6 +537,8 @@ az webapp config appsettings set -g "$RG" -n "$ADMIN_APP" -o none --settings \
 az webapp config set -g "$RG" -n "$ADMIN_APP" --startup-file "node server.cjs" -o none
 ok "done"
 
+ensure_logging
+ensure_appinsights
 # building takes a few minutes, which also gives the sites time to restart after the settings change
 build_all
 deploy_all      # the API is still publicly reachable at this point, so zip deploy works
@@ -487,6 +565,7 @@ wait_healthy "$PORTAL_URL/api/health"
 
 # ----------------------------- summary --------------------------------------
 cat >"$OUT_FILE" <<ENV
+APP_INSIGHTS=$AI_NAME
 VNET=$VNET
 RG=$RG
 LOCATION=$LOCATION
@@ -511,5 +590,7 @@ echo "  Purchasing portal : $PORTAL_URL"
 echo "  Admin portal      : $ADMIN_URL   ($ME_UPN has the $ADMIN_ROLE role)"
 echo "  API health        : $PORTAL_URL/api/health   (API itself is private: $API_URL)"
 echo "  Settings saved to : $OUT_FILE   (used by cleanup.sh)"
+echo "  App Insights      : Azure portal -> $AI_NAME (Application map, Live metrics, Performance, Failures)"
+echo "  API logs          : az monitor log-analytics query -w $LAW_GUID -o table --analytics-query \"AppServiceConsoleLogs | where _ResourceId contains '${API_APP}' | top 50 by TimeGenerated | project TimeGenerated, ResultDescription\""
 echo
 echo "  Note: the first request can take ~30-60s while the apps warm up."
