@@ -91,3 +91,8 @@ GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_OrderHistory_OrderId')
     CREATE INDEX IX_OrderHistory_OrderId ON dbo.OrderHistory (OrderId, ChangedAt);
 GO
+
+-- Admin order board: latest orders first
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Orders_CreatedAt')
+    CREATE INDEX IX_Orders_CreatedAt ON dbo.Orders (CreatedAt DESC, OrderId DESC) INCLUDE (Status);
+GO

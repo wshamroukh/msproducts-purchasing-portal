@@ -34,12 +34,39 @@ router.get('/stats', wrap(async (_req, res) => {
 
 /* ------------------------------- Orders -------------------------------- */
 
-// GET /api/admin/orders?status=Submitted&q=ORD-001000
+// GET /api/admin/orders                      -> board: ALL open orders + the latest closed ones
+// GET /api/admin/orders?status=..&q=..        -> filtered server-side (kept for API clients)
+// The admin portal loads the board once and filters by tab / search in the browser.
+const CLOSED_LIMIT = 500;
 router.get('/orders', wrap(async (req, res) => {
   const status = v.oneOf(req.query.status, 'status', STATUSES);
   const q = v.str(req.query.q, 'q', { max: 100 });
   const pool = await getPool();
   const r = pool.request();
+  const select = `
+    SELECT o.OrderId, o.OrderNumber, o.UserName, o.UserEmail, o.ShipToCity, o.ShipToCountry, o.CostCenter,
+           o.Status, o.Total, o.CreatedAt, o.UpdatedAt, s.Name AS StoreName, ISNULL(ic.ItemCount, 0) AS ItemCount
+    FROM dbo.Orders o
+    LEFT JOIN dbo.Stores s ON s.StoreId = o.StoreId
+    LEFT JOIN (SELECT OrderId, SUM(Quantity) AS ItemCount FROM dbo.OrderItems GROUP BY OrderId) ic ON ic.OrderId = o.OrderId`;
+
+  if (!status && !q) {
+    // Open orders are never cut off; closed ones (Delivered / Cancelled) are limited to the latest N.
+    const result = await r.input('closedLimit', sql.Int, CLOSED_LIMIT).query(`
+      WITH board AS (
+        SELECT OrderId FROM dbo.Orders WHERE Status IN ('Submitted', 'Processing', 'SentToStore')
+        UNION ALL
+        SELECT OrderId FROM (
+          SELECT TOP (@closedLimit) OrderId FROM dbo.Orders
+          WHERE Status IN ('Delivered', 'Cancelled') ORDER BY CreatedAt DESC, OrderId DESC) closed
+      )
+      ${select}
+      WHERE o.OrderId IN (SELECT OrderId FROM board)
+      ORDER BY o.CreatedAt DESC, o.OrderId DESC;`);
+    res.set('X-Closed-Limit', String(CLOSED_LIMIT));
+    return res.json(result.recordset);
+  }
+
   let where = '1 = 1';
   if (status) {
     r.input('status', sql.NVarChar(30), status);
@@ -50,12 +77,8 @@ router.get('/orders', wrap(async (req, res) => {
     where += ' AND (o.OrderNumber LIKE @q OR o.UserName LIKE @q OR o.UserEmail LIKE @q OR o.CostCenter LIKE @q)';
   }
   const result = await r.query(`
-    SELECT TOP 500 o.OrderId, o.OrderNumber, o.UserName, o.UserEmail, o.ShipToCity, o.ShipToCountry, o.CostCenter,
-           o.Status, o.Total, o.CreatedAt, o.UpdatedAt, s.Name AS StoreName,
-           (SELECT SUM(Quantity) FROM dbo.OrderItems i WHERE i.OrderId = o.OrderId) AS ItemCount
-    FROM dbo.Orders o LEFT JOIN dbo.Stores s ON s.StoreId = o.StoreId
-    WHERE ${where}
-    ORDER BY o.CreatedAt DESC, o.OrderId DESC;`);
+    SELECT TOP 500 * FROM (${select} WHERE ${where}) x
+    ORDER BY x.CreatedAt DESC, x.OrderId DESC;`);
   res.json(result.recordset);
 }));
 
