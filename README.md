@@ -115,6 +115,26 @@ script's output). In this mode the script:
 Use it to recover from a full deployment that failed after the web apps were created; running the full script again
 would create a new resource group instead.
 
+### Delete environments
+
+```bash
+./azure-deploy.sh destroy                           # every rg-<prefix>-* environment (runs in the background)
+./azure-deploy.sh destroy rg-msstore-uyrrr          # just one environment
+./azure-deploy.sh destroy rg-msstore-uyrrr --wait   # wait until it is gone and purge the soft-deleted Key Vaults
+```
+
+For each environment it deletes:
+- the Entra ID app registrations of the API, the purchasing portal, the admin portal and the load test
+  (they live outside the resource group, so they are removed first)
+- the resource group with everything in it (web apps, Function App, SQL, storage, VNet, private endpoints and DNS zones,
+  Log Analytics, Application Insights, Azure Load Testing, Key Vault); groups already being deleted are skipped
+- with `--wait`: the soft-deleted load-test Key Vault, so its name can be reused
+- the local `deployment-<prefix>-<suffix>.env` file, if it is in the current folder
+
+There is no confirmation prompt – check the name before you run it. Without a resource group name it deletes **every**
+environment whose resource group starts with `rg-<prefix>-` (`PREFIX`, default `msstore`). No `.env` file is needed.
+`./cleanup.sh deployment-<prefix>-<suffix>.env` still works as before.
+
 What the script does:
 1. Clones this repository
 2. Creates a resource group, a Linux App Service plan and 3 web apps (Node 22 LTS)

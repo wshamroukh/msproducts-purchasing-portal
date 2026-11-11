@@ -32,6 +32,9 @@
 #    SUBSCRIPTION="My Sub" ./azure-deploy.sh             # pick a subscription
 #    LOCATION=westeurope PREFIX=msshop ./azure-deploy.sh
 #    ADMIN_UPNS="alice@contoso.com,bob@contoso.com" ./azure-deploy.sh
+#    REDEPLOY_RG=rg-msstore-xxxxx ./azure-deploy.sh      # rebuild + redeploy code to an existing environment
+#    ./azure-deploy.sh destroy                           # delete every rg-<prefix>-* environment (background)
+#    ./azure-deploy.sh destroy rg-msstore-xxxxx --wait   # one environment; wait + purge Key Vaults
 # =============================================================================
 set -euo pipefail
 
@@ -184,7 +187,82 @@ ME_UPN=$(az ad signed-in-user show --query userPrincipalName -o tsv)
 ok "Subscription : $SUB_NAME ($SUB_ID)"
 ok "Tenant       : $TENANT_ID"
 ok "Signed in as : $ME_UPN"
-[[ -z "${REDEPLOY_RG:-}" ]] && ok "Location     : $LOCATION   Resource group: $RG"
+[[ -z "${REDEPLOY_RG:-}${DESTROY_RG:-}" && "${1:-}" != destroy ]] && ok "Location     : $LOCATION   Resource group: $RG"
+
+# ----------------------------- destroy --------------------------------------
+#   ./azure-deploy.sh destroy                    # every rg-<PREFIX>-* environment (background)
+#   ./azure-deploy.sh destroy rg-msstore-xxxxx   # just that environment
+#   ./azure-deploy.sh destroy [rg] --wait        # wait for completion + purge soft-deleted Key Vaults
+#   (DESTROY_RG=rg-msstore-xxxxx ./azure-deploy.sh still works = destroy that one environment)
+# Deletes each environment's Entra ID app registrations (API, portal, admin, load test) first - they
+# live outside the resource group - then the resource groups themselves.
+if [[ "${1:-}" == destroy || -n "${DESTROY_RG:-}" ]]; then
+  [[ "${1:-}" == destroy ]] && shift
+  D_WAIT=false; D_TARGET="${DESTROY_RG:-}"
+  for a in "$@"; do case "$a" in --wait) D_WAIT=true ;; rg-*) D_TARGET="$a" ;; *) die "Unknown destroy argument: $a" ;; esac; done
+  if [[ -n "$D_TARGET" ]]; then
+    DEL=("$D_TARGET")
+  else
+    # Every rg-<prefix>-* group, so environments from earlier runs / failed deployments go too
+    mapfile -t DEL < <(az group list --query "[?starts_with(name,'rg-${PREFIX}-')].name" -o tsv)
+  fi
+  step "Destroying: ${DEL[*]:-nothing found (rg-${PREFIX}-*)}"
+
+  # 1) Entra ID app registrations (found from the app settings and by their display names)
+  for rg in "${DEL[@]}"; do
+    NAME="${rg#rg-}"; D_PREFIX="${NAME%-*}"; D_SUFFIX="${NAME##*-}"
+    declare -A APP_IDS=()
+    if [[ "$(az group exists -n "$rg")" == true ]]; then
+      for app in $(az webapp list -g "$rg" --query "[].name" -o tsv 2>/dev/null); do
+        while IFS= read -r v; do
+          for id in ${v//,/ }; do [[ "$id" =~ ^[0-9a-f-]{36}$ ]] && APP_IDS[$id]=1; done
+        done < <(az webapp config appsettings list -g "$rg" -n "$app" \
+                   --query "[?name=='API_CLIENT_ID' || name=='CLIENT_ID' || name=='LOADTEST_CLIENT_IDS'].value" -o tsv 2>/dev/null)
+      done
+    fi
+    for dn in "${D_PREFIX}-api-${D_SUFFIX}" "${D_PREFIX}-portal-${D_SUFFIX}" "${D_PREFIX}-admin-${D_SUFFIX}" "${NAME}-loadtest"; do
+      for id in $(az ad app list --display-name "$dn" --query "[].appId" -o tsv); do APP_IDS[$id]=1; done
+    done
+    for id in "${!APP_IDS[@]}"; do
+      dn=$(az ad app show --id "$id" --query displayName -o tsv 2>/dev/null || echo "$id")
+      if az ad app delete --id "$id" -o none 2>/dev/null; then ok "deleted app registration $dn"; else warn "could not delete app registration $dn ($id)"; fi
+    done
+    unset APP_IDS
+  done
+
+  # 2) Resource groups (skip ones already being deleted)
+  for rg in "${DEL[@]}"; do
+    if [[ "$(az group exists -n "$rg")" != true ]]; then warn "$rg does not exist"; continue; fi
+    if [[ "$(az group show -n "$rg" --query properties.provisioningState -o tsv)" == Deleting ]]; then
+      ok "$rg is already being deleted"
+    else
+      az group delete -n "$rg" --yes --no-wait && ok "deleting $rg"
+    fi
+  done
+
+  # 3) Optional: wait, then purge the load-test Key Vaults (kv-lt-<suffix>-xxxx) so the names can be reused
+  if [[ "$D_WAIT" == true ]]; then
+    for rg in "${DEL[@]}"; do
+      az group exists -n "$rg" | grep -q true || continue
+      echo "    waiting for $rg to be deleted (usually 5-15 min)..."
+      az group wait -n "$rg" --deleted --interval 30 --timeout 3600
+      ok "$rg deleted"
+    done
+    for rg in "${DEL[@]}"; do
+      for kv in $(az keyvault list-deleted --query "[?starts_with(name,'kv-lt-${rg##*-}-')].name" -o tsv); do
+        az keyvault purge -n "$kv" -o none && ok "purged Key Vault $kv" \
+          || warn "could not purge Key Vault $kv (purge protection?) - it is released after its retention period"
+      done
+    done
+    echo -e "\n${c_ok}All resources deleted.${c_off}"
+  else
+    echo "    Deletion runs in the background (5-15 min). Check progress with:"
+    echo "      az group list --query \"[?starts_with(name,'rg-${PREFIX}-')].[name,properties.provisioningState]\" -o table"
+    echo "    Run '$0 destroy ${D_TARGET:+$D_TARGET }--wait' to wait for completion and purge the soft-deleted Key Vaults."
+  fi
+  for rg in "${DEL[@]}"; do rm -f "$PWD/deployment-${rg#rg-}.env"; done
+  exit 0
+fi
 
 # ----------------------------- build & deploy functions ---------------------
 build_api() {
