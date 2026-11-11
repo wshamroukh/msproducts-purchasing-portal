@@ -259,6 +259,46 @@ api_access() { # open|lock
   fi
 }
 
+# Inbound private endpoint + privatelink.azurewebsites.net zone for the API (idempotent).
+# The portal/admin proxy reaches the API only through this endpoint: their outbound traffic is
+# routed into the VNet, which has no internet egress, so without it every /api call times out.
+ensure_api_private_endpoint() {
+  step "Creating the API private endpoint and private DNS zone (inbound)"
+  local api_id loc host
+  api_id=$(az webapp show -g "$RG" -n "$API_APP" --query id -o tsv)
+  host=$(az webapp show -g "$RG" -n "$API_APP" --query defaultHostName -o tsv)
+  loc=$(az group show -n "$RG" --query location -o tsv)
+  if az network private-endpoint show -g "$RG" -n "pe-$API_APP" -o none 2>/dev/null; then
+    ok "reusing pe-$API_APP"
+  else
+    az network private-endpoint create -g "$RG" -n "pe-$API_APP" -l "$loc" \
+      --vnet-name "$VNET" --subnet snet-pe --private-connection-resource-id "$api_id" \
+      --group-id sites --connection-name "plc-$API_APP" -o none
+    ok "created pe-$API_APP"
+  fi
+  az network private-dns zone show -g "$RG" -n "$WEB_DNS_ZONE" -o none 2>/dev/null \
+    || az network private-dns zone create -g "$RG" -n "$WEB_DNS_ZONE" -o none
+  az network private-dns link vnet show -g "$RG" -z "$WEB_DNS_ZONE" -n "link-$VNET" -o none 2>/dev/null \
+    || az network private-dns link vnet create -g "$RG" -z "$WEB_DNS_ZONE" -n "link-$VNET" \
+         --virtual-network "$VNET" --registration-enabled false -o none
+  az network private-endpoint dns-zone-group show -g "$RG" --endpoint-name "pe-$API_APP" -n default -o none 2>/dev/null \
+    || az network private-endpoint dns-zone-group create -g "$RG" --endpoint-name "pe-$API_APP" \
+         -n default --private-dns-zone "$WEB_DNS_ZONE" --zone-name sites -o none
+  # zone groups do not always write the records - make sure the A record for the site exists
+  local rec="${host%%.azurewebsites.net}" ip
+  ip=$(az network private-endpoint show -g "$RG" -n "pe-$API_APP" --query "customDnsConfigs[0].ipAddresses[0]" -o tsv 2>/dev/null)
+  if [[ -z "$ip" ]]; then
+    local nic; nic=$(az network private-endpoint show -g "$RG" -n "pe-$API_APP" --query "networkInterfaces[0].id" -o tsv)
+    ip=$(az network nic show --ids "$nic" --query "ipConfigurations[0].privateIPAddress" -o tsv)
+  fi
+  for r in "$rec" "$rec.scm"; do
+    if [[ -z "$(az network private-dns record-set a show -g "$RG" -z "$WEB_DNS_ZONE" -n "$r" --query "aRecords[0].ipv4Address" -o tsv 2>/dev/null)" ]]; then
+      az network private-dns record-set a add-record -g "$RG" -z "$WEB_DNS_ZONE" -n "$r" -a "$ip" -o none
+    fi
+  done
+  ok "$host now resolves to $ip inside $VNET"
+}
+
 # Central logging. The API is private (its log stream / Kudu site is blocked), so container
 # stdout, HTTP and platform logs of all 3 apps are sent to a Log Analytics workspace instead.
 ensure_logging() {
@@ -319,6 +359,32 @@ ensure_private_dns_zone() { # <zone> <vnet>
     az network private-dns link vnet create -g "$RG" -z "$zone" -n "link-$vnet" --virtual-network "$vnet" --registration-enabled false -o none
 }
 
+ensure_pe_a_record() { # <private endpoint> <zone> <record name>
+  # Private DNS zone groups do not always write the A record (seen with policy-managed DNS); add it if missing.
+  local pe=$1 zone=$2 name=$3 ip nic
+  ip=$(az network private-endpoint show -g "$RG" -n "$pe" --query "customDnsConfigs[0].ipAddresses[0]" -o tsv 2>/dev/null)
+  if [[ -z "$ip" ]]; then
+    nic=$(az network private-endpoint show -g "$RG" -n "$pe" --query "networkInterfaces[0].id" -o tsv)
+    ip=$(az network nic show --ids "$nic" --query "ipConfigurations[0].privateIPAddress" -o tsv)
+  fi
+  if [[ -z "$(az network private-dns record-set a show -g "$RG" -z "$zone" -n "$name" --query "aRecords[0].ipv4Address" -o tsv 2>/dev/null)" ]]; then
+    az network private-dns record-set a add-record -g "$RG" -z "$zone" -n "$name" -a "$ip" -o none
+    ok "added DNS record $name.$zone -> $ip"
+  fi
+}
+
+assign_role() { # <principal id> <role> <scope> - retries while a new managed identity replicates
+  local i out
+  for ((i = 1; i <= 6; i++)); do
+    if out=$(az role assignment create --assignee-object-id "$1" --assignee-principal-type ServicePrincipal \
+               --role "$2" --scope "$3" -o none 2>&1); then return 0; fi
+    [[ "$out" == *"already exists"* || "$out" == *RoleAssignmentExists* ]] && return 0
+    sleep 15
+  done
+  warn "could not assign '$2' to $1: ${out:0:300}"
+  return 0
+}
+
 ensure_pdf_service() {
   step "Order PDF service (Storage account + Function App)"
   local loc vnet plan_id sa sa_id sub pe fn fn_mi api_mi role tmp
@@ -371,6 +437,7 @@ JSON
     az network private-endpoint dns-zone-group show -g "$RG" --endpoint-name "$pe" -n default -o none 2>/dev/null || \
       az network private-endpoint dns-zone-group create -g "$RG" --endpoint-name "$pe" -n default \
         --private-dns-zone "privatelink.$sub.core.windows.net" --zone-name "$sub" -o none
+    ensure_pe_a_record "$pe" "privatelink.$sub.core.windows.net" "$sa"
   done
   ok "private endpoints for blob, queue and table"
 
@@ -378,8 +445,10 @@ JSON
   fn=$(az functionapp list -g "$RG" --query "[?tags.purpose=='order-pdfs'].name | [0]" -o tsv)
   if [[ -z "$fn" ]]; then
     fn="func-${RG#rg-}-pdf"
+    # The storage account only accepts private traffic, so the app must be VNet integrated from the start
     az functionapp create -g "$RG" -n "$fn" -p "$plan_id" --storage-account "$sa" --os-type Linux \
-      --runtime node --runtime-version 22 --functions-version 4 --tags purpose=order-pdfs -o none
+      --runtime node --runtime-version 22 --functions-version 4 --tags purpose=order-pdfs \
+      --vnet "$vnet" --subnet snet-app -o none
     ok "created function app $fn"
   else
     ok "reusing function app $fn"
@@ -389,13 +458,12 @@ JSON
   api_mi=$(az webapp identity show -g "$RG" -n "$API_APP" --query principalId -o tsv)
 
   # -- RBAC on the storage account (no keys anywhere)
+  [[ -n "$api_mi" ]] || api_mi=$(az webapp identity assign -g "$RG" -n "$API_APP" --query principalId -o tsv)
   for role in "Storage Blob Data Owner" "Storage Queue Data Contributor" "Storage Table Data Contributor"; do
-    az role assignment create --assignee-object-id "$fn_mi" --assignee-principal-type ServicePrincipal \
-      --role "$role" --scope "$sa_id" -o none 2>/dev/null || true
+    assign_role "$fn_mi" "$role" "$sa_id"
   done
   for role in "Storage Queue Data Message Sender" "Storage Blob Data Reader"; do
-    az role assignment create --assignee-object-id "$api_mi" --assignee-principal-type ServicePrincipal \
-      --role "$role" --scope "$sa_id" -o none 2>/dev/null || true
+    assign_role "$api_mi" "$role" "$sa_id"
   done
   ok "roles: function (blob/queue/table data), API (queue sender, blob reader)"
 
@@ -468,8 +536,14 @@ if [[ -n "${REDEPLOY_RG:-}" ]]; then
   ensure_appinsights
   ensure_pdf_service
   build_all
+  VNET=$(az network vnet list -g "$RG" --query "[0].name" -o tsv)
   API_LOCKED=0
-  if az network private-endpoint show -g "$RG" -n "pe-$API_APP" -o none 2>/dev/null; then
+  HAS_PE=0
+  az network private-endpoint show -g "$RG" -n "pe-$API_APP" -o none 2>/dev/null && HAS_PE=1
+  if [[ $HAS_PE -eq 0 ]]; then
+    warn "$API_APP has no private endpoint yet (an earlier full deployment stopped before that step) - it will be created now"
+  fi
+  if true; then  # always open for the zip deploy; re-locked below
     API_LOCKED=1
     step "Temporarily opening public access to $API_APP for the deployment"
     api_access open
@@ -477,6 +551,7 @@ if [[ -n "${REDEPLOY_RG:-}" ]]; then
     ok "opened (requests still need a valid Entra ID token)"
   fi
   deploy_all
+  [[ $HAS_PE -eq 0 && -n "$VNET" ]] && ensure_api_private_endpoint
   if [[ $API_LOCKED -eq 1 ]]; then
     step "Locking $API_APP again"
     api_access lock; trap 'rm -rf "$WORKDIR"' EXIT
@@ -674,17 +749,7 @@ build_all
 deploy_all      # the API is still publicly reachable at this point, so zip deploy works
 
 # ----------------------------- lock down the API ----------------------------
-step "Creating the API private endpoint and private DNS zone (inbound)"
-API_ID=$(az webapp show -g "$RG" -n "$API_APP" --query id -o tsv)
-az network private-endpoint create -g "$RG" -n "pe-$API_APP" -l "$LOCATION" \
-  --vnet-name "$VNET" --subnet snet-pe --private-connection-resource-id "$API_ID" \
-  --group-id sites --connection-name "plc-$API_APP" -o none
-az network private-dns zone create -g "$RG" -n "$WEB_DNS_ZONE" -o none
-az network private-dns link vnet create -g "$RG" -z "$WEB_DNS_ZONE" -n "link-$VNET" \
-  --virtual-network "$VNET" --registration-enabled false -o none
-az network private-endpoint dns-zone-group create -g "$RG" --endpoint-name "pe-$API_APP" \
-  -n default --private-dns-zone "$WEB_DNS_ZONE" --zone-name sites -o none
-ok "$API_HOST now resolves to a private IP inside $VNET"
+ensure_api_private_endpoint
 
 step "Blocking all public access to the API (main and deployment site)"
 api_access lock

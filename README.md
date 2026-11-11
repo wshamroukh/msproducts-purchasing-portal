@@ -72,7 +72,7 @@ docker-compose.yml  local SQL Server for development
 
 ## Deploy to Azure (az cli)
 
-Run in **Azure Cloud Shell (Bash)** – it already has `az`, `git`, `node`, `npm`, `zip` and `curl`:
+Run from **WSL (Ubuntu)**, any Linux/macOS shell or Azure Cloud Shell. Missing prerequisites (`az`, `git`, `node`/`npm`, `zip`, `curl`) are installed automatically; sign in with `az login` first:
 
 ```bash
 curl -sO https://raw.githubusercontent.com/wshamroukh/msproducts-purchasing-portal/main/deploy/azure-deploy.sh
@@ -84,15 +84,36 @@ Optional settings (environment variables):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LOCATION` | `uaenorth` | Azure region |
+| `LOCATION` | `centralindia` | Azure region |
+| `SUBSCRIPTION` | current `az` subscription | Subscription name or id to deploy into |
 | `PREFIX` | `msstore` | Name prefix for all resources |
 | `RG` | `rg-<prefix>-<random>` | Resource group name |
 | `APP_SKU` | `B1` | App Service plan SKU |
 | `SQL_SKU` | `Basic` | Azure SQL service objective |
 | `ADMIN_UPNS` | – | Extra users (comma separated) who get the `Store.Admin` role |
 | `REPO_URL` / `BRANCH` | this repo / `main` | Source to clone |
+| `REDEPLOY_RG` | – | Name of an **existing** resource group (e.g. `rg-msstore-uyrrr`). Skips infrastructure creation and only rebuilds and redeploys the code to it – see below |
 
 Example: `LOCATION=westeurope ADMIN_UPNS="alice@contoso.com" ./azure-deploy.sh`
+
+### Redeploy code to an existing environment
+
+After you push changes to GitHub, update a running environment without recreating anything:
+
+```bash
+REDEPLOY_RG=rg-msstore-uyrrr ./azure-deploy.sh
+```
+
+Replace `rg-msstore-uyrrr` with your resource group (it is in the `deployment-<prefix>-<suffix>.env` file and in the
+script's output). In this mode the script:
+- clones the latest code, rebuilds the API, both SPAs and the order-PDF Function App, and zip-deploys them
+- adds any pieces that are missing (Log Analytics, Application Insights, the PDF storage account and Function App)
+- creates the API private endpoint and private DNS zone if an earlier full deployment stopped before that step
+- opens the private API only for the deployment and locks it again afterwards (also on Ctrl+C or failure)
+- waits until the portal reports the API as healthy
+
+Use it to recover from a full deployment that failed after the web apps were created; running the full script again
+would create a new resource group instead.
 
 What the script does:
 1. Clones this repository

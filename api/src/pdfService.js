@@ -79,6 +79,18 @@ function queueOrderPdf(pool, orderId) {
     .catch((err) => console.error(`[pdf] could not queue PDF for order ${orderId}: ${err.message}`));
 }
 
+/** Turns a storage / identity failure into a clear 503 instead of a generic 500, and logs the cause. */
+function pdfStorageError(res, err) {
+  const code = err.code || err.name || 'Error';
+  console.error(`[pdf] storage request failed: status=${err.statusCode ?? '-'} code=${code} ${err.message}`);
+  let hint = 'The PDF storage is not reachable from the API.';
+  if (code === 'AuthorizationPermissionMismatch') hint = 'The API identity has no data role on the PDF storage account yet (role assignments can take a few minutes).';
+  else if (code === 'AuthorizationFailure' || err.statusCode === 403) hint = 'The PDF storage account refused the request - the API is probably reaching it over the public network instead of its private endpoint (check the privatelink DNS records).';
+  else if (code === 'CredentialUnavailableError' || code === 'AuthenticationRequiredError') hint = 'The API could not get a managed identity token for Storage.';
+  else if (code === 'ENOTFOUND' || code === 'ETIMEDOUT' || code === 'ECONNREFUSED' || code === 'REQUEST_SEND_ERROR') hint = 'The PDF storage account could not be reached (DNS / private endpoint).';
+  return res.status(503).json({ error: `PDF unavailable: ${hint}`, code });
+}
+
 /** Express helper: streams the PDF of the order's current version, or 202 while it is generated. */
 async function sendOrderPdf(res, order) {
   if (!enabled()) return res.status(503).json({ error: 'PDF generation is not configured for this environment' });
@@ -92,9 +104,13 @@ async function sendOrderPdf(res, order) {
     });
     return res.send(buf);
   } catch (err) {
-    if (err.statusCode !== 404) throw err;
+    if (err.statusCode !== 404) return pdfStorageError(res, err);
   }
-  await requestPdf(order);
+  try {
+    await requestPdf(order);
+  } catch (err) {
+    return pdfStorageError(res, err);
+  }
   res.set('Retry-After', '2');
   return res.status(202).json({ status: 'generating', message: 'The PDF is being generated - try again in a few seconds.' });
 }
