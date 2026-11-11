@@ -43,7 +43,7 @@ SUBSCRIPTION="${SUBSCRIPTION:-}"          # subscription name or id (default: cu
 PREFIX="${PREFIX:-msstore}"
 SUFFIX="${SUFFIX:-$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 5 || true)}"
 RG="${RG:-rg-${PREFIX}-${SUFFIX}}"
-APP_SKU="${APP_SKU:-B1}"
+APP_SKU="${APP_SKU:-P0v3}"          # B1 works but is slow to restart 4 apps (API, portal, admin, PDF function)
 NODE_RUNTIME="${NODE_RUNTIME:-NODE:22-lts}"
 SQL_SKU="${SQL_SKU:-Basic}"
 DB_NAME="${DB_NAME:-msstoredb}"
@@ -246,6 +246,22 @@ deploy_all() {
 # Public access to the API web app.
 #   lock: only reachable through its private endpoint (main + deployment/SCM site)
 #   open: temporarily reachable so code can be zip-deployed from this machine
+# Every App Settings change restarts the app (2-4 minutes of downtime on a small plan), so only
+# write settings whose value actually differs. Usage: set_app_settings webapp|functionapp <name> KEY=VALUE...
+set_app_settings() {
+  local kind=$1 name=$2; shift 2
+  local -A cur=(); local k v kv changed=()
+  while IFS=$'\t' read -r k v; do [[ -n "$k" ]] && cur[$k]=$v; done < <(
+    az "$kind" config appsettings list -g "$RG" -n "$name" --query "[].[name,value]" -o tsv 2>/dev/null)
+  for kv in "$@"; do
+    k=${kv%%=*}; v=${kv#*=}
+    if [[ ! -v "cur[$k]" || "${cur[$k]}" != "$v" ]]; then changed+=("$kv"); fi
+  done
+  if ((${#changed[@]})); then
+    az "$kind" config appsettings set -g "$RG" -n "$name" -o none --settings "${changed[@]}"
+  fi
+}
+
 api_access() { # open|lock
   local id; id=$(az webapp show -g "$RG" -n "$API_APP" --query id -o tsv)
   if [[ $1 == open ]]; then
@@ -342,7 +358,7 @@ ensure_appinsights() {
     warn "Azure Monitor Private Link Scope. Without one, Application Insights will stay empty."
   fi
   for app in "$API_APP" "$PORTAL_APP" "$ADMIN_APP"; do
-    az webapp config appsettings set -g "$RG" -n "$app" -o none --settings \
+    set_app_settings webapp "$app" \
       APPLICATIONINSIGHTS_CONNECTION_STRING="$AI_CS" ApplicationInsightsAgent_EXTENSION_VERSION="~3"
     ok "$app -> $ai (auto-instrumentation on)"
   done
@@ -468,13 +484,15 @@ JSON
   ok "roles: function (blob/queue/table data), API (queue sender, blob reader)"
 
   # -- function app settings: identity-based storage for the host and for the PDF bindings
-  az functionapp config appsettings delete -g "$RG" -n "$fn" --setting-names AzureWebJobsStorage -o none 2>/dev/null || true
+  if [[ -n "$(az functionapp config appsettings list -g "$RG" -n "$fn" --query "[?name=='AzureWebJobsStorage'].name | [0]" -o tsv)" ]]; then
+    az functionapp config appsettings delete -g "$RG" -n "$fn" --setting-names AzureWebJobsStorage -o none
+  fi
   local fn_settings=(AzureWebJobsStorage__accountName="$sa"
     PdfStorage__blobServiceUri="https://$sa.blob.core.windows.net"
     PdfStorage__queueServiceUri="https://$sa.queue.core.windows.net"
     FUNCTIONS_WORKER_RUNTIME=node WEBSITE_RUN_FROM_PACKAGE=1 SCM_DO_BUILD_DURING_DEPLOYMENT=false)
   if [[ -n "${AI_CS:-}" ]]; then fn_settings+=(APPLICATIONINSIGHTS_CONNECTION_STRING="$AI_CS"); fi
-  az functionapp config appsettings set -g "$RG" -n "$fn" -o none --settings "${fn_settings[@]}"
+  set_app_settings functionapp "$fn" "${fn_settings[@]}"
   az functionapp update -g "$RG" -n "$fn" --set httpsOnly=true -o none
   az webapp config set -g "$RG" -n "$fn" -o none --always-on true --ftps-state Disabled --min-tls-version 1.2 \
     --vnet-route-all-enabled true
@@ -487,7 +505,7 @@ JSON
     '{"ipSecurityRestrictionsDefaultAction":"Deny","scmIpSecurityRestrictionsDefaultAction":"Allow","scmIpSecurityRestrictionsUseMain":false}'
   ok "$fn: VNet integrated, managed identity, inbound blocked"
 
-  az webapp config appsettings set -g "$RG" -n "$API_APP" -o none --settings PDF_STORAGE_ACCOUNT="$sa"
+  set_app_settings webapp "$API_APP" PDF_STORAGE_ACCOUNT="$sa"
   ok "API configured to queue and serve PDFs from $sa"
   PDF_STORAGE="$sa"
 }
@@ -530,7 +548,7 @@ if [[ -n "${REDEPLOY_RG:-}" ]]; then
   [[ -n "$API_APP" && -n "$PORTAL_APP" && -n "$ADMIN_APP" ]] || die "Could not find the api/portal/admin web apps in $RG"
   ok "API $API_APP, portal $PORTAL_APP, admin $ADMIN_APP"
   for app in "$API_APP" "$PORTAL_APP" "$ADMIN_APP"; do
-    az webapp config appsettings set -g "$RG" -n "$app" -o none --settings WEBSITE_RUN_FROM_PACKAGE=1 SCM_DO_BUILD_DURING_DEPLOYMENT=false
+    set_app_settings webapp "$app" WEBSITE_RUN_FROM_PACKAGE=1 SCM_DO_BUILD_DURING_DEPLOYMENT=false
   done
   ensure_logging
   ensure_appinsights

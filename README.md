@@ -88,7 +88,7 @@ Optional settings (environment variables):
 | `SUBSCRIPTION` | current `az` subscription | Subscription name or id to deploy into |
 | `PREFIX` | `msstore` | Name prefix for all resources |
 | `RG` | `rg-<prefix>-<random>` | Resource group name |
-| `APP_SKU` | `B1` | App Service plan SKU |
+| `APP_SKU` | `P0v3` | App Service plan SKU (shared by the API, both portals and the PDF Function App). `B1` is cheaper but restarts take several minutes |
 | `SQL_SKU` | `Basic` | Azure SQL service objective |
 | `ADMIN_UPNS` | – | Extra users (comma separated) who get the `Store.Admin` role |
 | `REPO_URL` / `BRANCH` | this repo / `main` | Source to clone |
